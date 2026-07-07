@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Catalog Scraper",
+  "description": "An AI-powered and selector-based full-stack scraper for Telegram channel directories (tgramsearch.com and tgramcat.com) that extracts direct Telegram links.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
