@@ -140,12 +140,17 @@ export default function App() {
         if (data.searchStats) {
           Object.keys(data.searchStats).forEach((srcKey) => {
             if (!combinedStats[srcKey]) {
-              combinedStats[srcKey] = { pagesFetched: 0, totalFound: 0, duplicatesFiltered: 0, uniqueAdded: 0 };
+              combinedStats[srcKey] = { pagesFetched: 0, rawCardsFound: 0, totalFound: 0, tgLinksFound: 0, duplicatesFiltered: 0, uniqueAdded: 0 };
             }
             combinedStats[srcKey].pagesFetched += data.searchStats[srcKey].pagesFetched || 0;
+            combinedStats[srcKey].rawCardsFound = (combinedStats[srcKey].rawCardsFound || 0) + (data.searchStats[srcKey].rawCardsFound || 0);
             combinedStats[srcKey].totalFound += data.searchStats[srcKey].totalFound || 0;
+            combinedStats[srcKey].tgLinksFound = (combinedStats[srcKey].tgLinksFound || 0) + (data.searchStats[srcKey].tgLinksFound || 0);
             combinedStats[srcKey].duplicatesFiltered += data.searchStats[srcKey].duplicatesFiltered || 0;
             combinedStats[srcKey].uniqueAdded += data.searchStats[srcKey].uniqueAdded || 0;
+
+            const st = data.searchStats[srcKey];
+            addLog(`[Report] Найдено ${st.rawCardsFound || st.totalFound} (из них ${st.tgLinksFound !== undefined ? st.tgLinksFound : st.totalFound} содержат t.me), уникальных: ${st.uniqueAdded} именно для ${srcKey}.`);
           });
         }
 
@@ -442,7 +447,7 @@ export default function App() {
     setCurrentPage(1);
   }, [textFilter, sourceFilter, statusFilter, chatTypeFilter, pageSize]);
 
-  // Export to CSV helper
+    // Export to CSV helper
   const exportToCSV = () => {
     if (filteredChannels.length === 0) return;
     
@@ -460,16 +465,17 @@ export default function App() {
       `"${c.description.replace(/"/g, '""')}"`
     ]);
 
-    const csvContent = "data:text/csv;charset=utf-8,\uFEFF" 
-      + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
+    const csvContent = "\uFEFF" + [headers.join(";"), ...rows.map(e => e.join(";"))].join("\n");
     
-    const encodedUri = encodeURI(csvContent);
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
+    link.setAttribute("href", url);
     link.setAttribute("download", `telegram_channels_${new Date().toISOString().split('T')[0]}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
     addLog(`[Export] Successfully compiled and downloaded CSV dataset for ${filteredChannels.length} channels.`);
   };
 

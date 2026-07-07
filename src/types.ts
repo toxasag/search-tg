@@ -20,7 +20,9 @@ export interface ScrapedChannel {
 export interface SearchStats {
   [source: string]: {
     pagesFetched: number;
+    rawCardsFound?: number;
     totalFound: number;
+    tgLinksFound?: number;
     duplicatesFiltered: number;
     uniqueAdded: number;
   };

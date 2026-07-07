@@ -192,7 +192,8 @@ function parseWithSelectors(html: string, source: string, baseUrl: string): any[
         const href = $(aEl).attr("href") || "";
         return href.includes("/channel/") || href.includes("/group/") || href.includes("/catalog/") || 
                href.includes("/cat/") || href.includes("/chat/") || href.includes("/show/") || 
-               href.includes("/t/") || href.includes("/tg/") || href.includes("/details/") || /t\.me\//i.test(href);
+               href.includes("/t/") || href.includes("/tg/") || href.includes("/details/") || 
+               href.includes("/join/") || /t\.me\//i.test(href);
       }).first();
 
       if ($link.length > 0) {
@@ -230,9 +231,16 @@ function parseWithSelectors(html: string, source: string, baseUrl: string): any[
           });
 
           // If no direct t.me link, try to deduce it
-          const deduced = deduceTelegramUrl(detailUrl, title, description || "");
-          const finalTelegramUrl = directTgUrl || deduced.telegramUrl;
-          const finalUsername = directUsername || deduced.username;
+          let deduced = deduceTelegramUrl(detailUrl, title, description || "");
+          let finalTelegramUrl = directTgUrl || deduced.telegramUrl;
+          let finalUsername = directUsername || deduced.username;
+          let isConfirmedSuccess = !!directTgUrl;
+
+          if (source === "tgramsearch" && detailUrl.includes("/join/")) {
+             finalTelegramUrl = detailUrl;
+             finalUsername = detailUrl.split("/join/")[1] || null;
+             isConfirmedSuccess = false;
+          }
 
           results.push({
             title,
@@ -243,7 +251,7 @@ function parseWithSelectors(html: string, source: string, baseUrl: string): any[
             source,
             telegramUrl: finalTelegramUrl,
             username: finalUsername,
-            extractionStatus: directTgUrl ? "success" : (finalTelegramUrl ? "guessed" : "pending"),
+            extractionStatus: isConfirmedSuccess ? "success" : (finalTelegramUrl ? "guessed" : "pending"),
             chatType: detectChatType(finalTelegramUrl, title, description || "", detailUrl, subscribers || null)
           });
         }
@@ -395,7 +403,7 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
 
   const results: any[] = [];
   const logs: string[] = [];
-  const searchStats: Record<string, { pagesFetched: number; totalFound: number; duplicatesFiltered: number; uniqueAdded: number }> = {};
+  const searchStats: Record<string, { pagesFetched: number; totalFound: number; tgLinksFound?: number; rawCardsFound?: number; duplicatesFiltered: number; uniqueAdded: number }> = {};
 
   logs.push(`Starting automated deep search across sources: [${sources.join(", ")}] for "${query}"...`);
 
@@ -403,6 +411,7 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
     searchStats[src] = {
       pagesFetched: 0,
       totalFound: 0,
+      tgLinksFound: 0,
       duplicatesFiltered: 0,
       uniqueAdded: 0
     };
@@ -462,6 +471,43 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
                 logs.push(`[AI Error] Gemini AI failed on page ${p}: ${aiErr.message || aiErr}`);
               }
             }
+
+            if (src === "tgramsearch" && parsedResults.length > 0) {
+               const chunkSize = 5;
+               for (let i = 0; i < parsedResults.length; i += chunkSize) {
+                 const chunk = parsedResults.slice(i, i + chunkSize);
+                 await Promise.all(chunk.map(async (r: any) => {
+                   if (r.detailUrl && r.detailUrl.includes("/join/")) {
+                     try {
+                       const controller = new AbortController();
+                       const timeoutId = setTimeout(() => controller.abort(), 3000);
+                       const detRes = await fetch(r.detailUrl, {
+                         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+                         signal: controller.signal
+                       });
+                       clearTimeout(timeoutId);
+                       if (detRes.ok) {
+                          const dhtml = await detRes.text();
+                          const $d = cheerio.load(dhtml);
+                          const btnHref = $d(".tg-channel__btn a").attr("href");
+                          if (btnHref && (btnHref.startsWith("tg://") || btnHref.includes("t.me/"))) {
+                             r.telegramUrl = btnHref;
+                             r.extractionStatus = "success";
+                             if (btnHref.includes("resolve?domain=")) {
+                                 r.username = btnHref.split("domain=")[1];
+                             } else if (btnHref.includes("join?invite=")) {
+                                 r.username = btnHref.split("invite=")[1];
+                             }
+                          }
+                       }
+                     } catch (e) {
+                       // ignore timeouts to not crash the whole batch
+                     }
+                   }
+                 }));
+               }
+            }
+
             let rawCardCount = 0;
             if (html) {
               const $ = cheerio.load(html);
@@ -469,7 +515,7 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
               if (src === "lyzem") {
                 cardSelector = ".search-result";
               } else if (src === "tgramsearch") {
-                cardSelector = ".main-search-button-result-item, .main-search-button-result-item-wrapper";
+                cardSelector = ".tg-channel";
               }
               rawCardCount = Math.max(
                 parsedResults.length,
@@ -493,6 +539,11 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
         for (const pageRes of batchResults) {
           searchStats[src].pagesFetched++;
 
+          if (searchStats[src].rawCardsFound === undefined) {
+             searchStats[src].rawCardsFound = 0;
+          }
+          searchStats[src].rawCardsFound += pageRes.rawCardCount || 0;
+
           const isPageEmpty = pageRes.rawCardCount !== undefined ? pageRes.rawCardCount === 0 : pageRes.results.length === 0;
 
           if (isPageEmpty) {
@@ -509,6 +560,10 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
           const pageAddedResults: any[] = [];
 
           searchStats[src].totalFound += pageRes.results.length;
+          const tgLinksCount = pageRes.results.filter((r: any) => 
+            r.telegramUrl && (r.telegramUrl.includes("t.me") || r.telegramUrl.includes("telegram.me") || r.telegramUrl.includes("tgramsearch.com/join/") || r.telegramUrl.startsWith("tg://"))
+          ).length;
+          searchStats[src].tgLinksFound = (searchStats[src].tgLinksFound || 0) + tgLinksCount;
 
           for (const item of pageRes.results) {
             const dupKey = `${item.title.toLowerCase()}_${item.detailUrl.toLowerCase()}`;
@@ -680,7 +735,8 @@ function extractLinkWithSelectors(html: string): { telegramUrl: string | null; u
   const tgPatterns = [
     /https?:\/\/t\.me\/[a-zA-Z0-9_+]{3,}/i,
     /https?:\/\/telegram\.me\/[a-zA-Z0-9_+]{3,}/i,
-    /tg:\/\/resolve\?domain=[a-zA-Z0-9_+]{3,}/i
+    /tg:\/\/resolve\?domain=[a-zA-Z0-9_+]{3,}/i,
+    /tg:\/\/join\?invite=[a-zA-Z0-9_+]+/i
   ];
 
   let telegramUrl: string | null = null;
