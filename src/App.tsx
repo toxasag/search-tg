@@ -13,7 +13,6 @@ import LogsPanel from "./components/LogsPanel";
 export default function App() {
   // Scraper State
   const [query, setQuery] = useState("");
-  const [appendResults, setAppendResults] = useState(false);
   const [source, setSource] = useState<SearchSource>("all");
   const [mode, setMode] = useState<ParseMode>("fast");
   const [limitPages, setLimitPages] = useState<number>(500); // Max pages to scan per catalog, default to 500
@@ -115,7 +114,7 @@ export default function App() {
     addLog(`Initiating multi-query search for [${rawQueries.join(", ")}] on ${source === "all" ? "all directories" : source} using ${mode === "fast" ? "Fast Selector Mode" : "AI Scraper Mode"}...`);
 
     try {
-      let accumulatedChannels: ScrapedChannel[] = appendResults ? [...channels] : [];
+      let accumulatedChannels: ScrapedChannel[] = [...channels];
       const combinedStats: SearchStats = {};
       let duplicatesTotal = 0;
 
@@ -526,7 +525,8 @@ export default function App() {
       return;
     }
     saveChannels([]);
-    addLog(`[Database] Cleared all scraped channel records from memory.`);
+    setLastSearchStats(null);
+    addLog(`[Database] Cleared all scraped channel records and stats from memory.`);
     setIsConfirmingClear(false);
   };
 
@@ -675,16 +675,7 @@ export default function App() {
                       />
                       <Search className="absolute left-3 top-3 text-slate-500 w-3.5 h-3.5" />
                     </div>
-                    <div className="mt-2.5 flex items-center justify-between">
-                      <label className="flex items-center gap-2 cursor-pointer group text-slate-400 hover:text-slate-200 select-none">
-                        <input
-                          type="checkbox"
-                          checked={appendResults}
-                          onChange={(e) => setAppendResults(e.target.checked)}
-                          className="rounded border-slate-750 bg-[#0A0B0E] text-blue-600 focus:ring-0 focus:ring-offset-0 cursor-pointer w-3.5 h-3.5"
-                        />
-                        <span className="text-[11px] font-medium">Append results to current list</span>
-                      </label>
+                    <div className="mt-2.5 flex items-center justify-end">
                       <span className="text-[9px] font-mono text-slate-500 leading-none">Multi-query (split by comma)</span>
                     </div>
                   </div>
@@ -1067,8 +1058,15 @@ export default function App() {
                 </div>
 
                 {/* Table list */}
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-xs">
+                <div className="overflow-x-auto overflow-hidden">
+                  <table className="w-full text-left border-collapse text-xs" style={{ tableLayout: "fixed", width: "100%" }}>
+                    <colgroup>
+                      <col style={{ width: "35%" }} />
+                      <col style={{ width: "10%" }} />
+                      <col style={{ width: "8%" }} />
+                      <col style={{ width: "32%" }} />
+                      <col style={{ width: "15%" }} />
+                    </colgroup>
                     <thead className="bg-[#0A0B0E] text-slate-500 text-[10px] uppercase font-mono font-bold border-b border-slate-800 sticky top-0">
                       <tr>
                         <th className="px-4 py-3">Channel Name & Description</th>
@@ -1093,7 +1091,7 @@ export default function App() {
                           <tr key={channel.id} className="hover:bg-slate-800/40 transition-colors group">
                             
                             {/* Name & Desc */}
-                            <td className="px-4 py-3 max-w-sm">
+                            <td className="px-4 py-3">
                               <div className="flex items-start gap-2.5">
                                 {channel.imageUrl ? (
                                   <img 

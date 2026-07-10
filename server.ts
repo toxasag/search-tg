@@ -74,7 +74,8 @@ function deduceTelegramUrl(detailUrl: string, title: string, description: string
   if (pathMatch && pathMatch[1]) {
     const username = pathMatch[1];
     const excluded = ["search", "about", "contact", "privacy", "terms", "faq", "help", "channels", "groups", "add", "catalog", "category", "categories", "en", "ru", "feedback", "show", "tg", "t", "pages", "page"];
-    if (!excluded.includes(username.toLowerCase())) {
+    // Skip numeric-only IDs (e.g. /channel/13460077389) — these are Telegram internal IDs, not usernames
+    if (!excluded.includes(username.toLowerCase()) && !/^\d+$/.test(username)) {
       return { telegramUrl: `https://t.me/${username}`, username };
     }
   }
@@ -175,7 +176,328 @@ function parseWithSelectors(html: string, source: string, baseUrl: string): any[
     return new URL(urlStr, baseUrl).toString();
   };
 
-  // Generic card scanners
+  // ── tgsearch-specific parser ──
+  if (source === "tgsearch") {
+    // Search result pages have .channel-card elements (skip .is-promo cards)
+    // Each card: h2.channel-card__title > a[href="/channel/<id>"] with tg:// link
+    //           ul.channel-card__options > li (subscribers) + li (username or "приватный")
+    //           .channel-card__description
+    $(".channel-card").each((_, el) => {
+      const $card = $(el);
+      // Skip promo/ad cards
+      if ($card.hasClass("is-promo") || $card.hasClass("is-promo-1")) return;
+
+      const $titleLink = $card.find(".channel-card__title a").first();
+      const href = $titleLink.attr("href") || "";
+      if (!href.includes("/channel/")) return;
+
+      const detailUrl = resolveUrl(href);
+      const title = $titleLink.text().trim();
+
+      // Extract subscribers from first <li> (contains <i class="fa fa-user">)
+      let subscribers: string | null = null;
+      $card.find(".channel-card__options li").each((_, li) => {
+        const text = $(li).text().trim();
+        if (text.match(/\d/) && !text.startsWith("@")) {
+          subscribers = text.replace(/\s+/g, " ").trim();
+        }
+      });
+
+      // Extract username from second <li> (e.g. @freelancehuntnews or "приватный")
+      let username: string | null = null;
+      const optionsLis = $card.find(".channel-card__options li");
+      if (optionsLis.length >= 2) {
+        const uText = $(optionsLis[1]).text().trim();
+        if (uText.startsWith("@")) {
+          username = uText.substring(1); // remove @
+        }
+      }
+
+      const description = $card.find(".channel-card__description").first().text().trim();
+      const imageUrl = resolveUrl($card.find(".channel-card__media img").attr("src") || "");
+
+      // Build telegram URL
+      let telegramUrl: string | null = null;
+      let extractionStatus: string = "pending";
+      if (username) {
+        telegramUrl = `https://t.me/${username}`;
+        extractionStatus = "success";
+      } else if (description) {
+        // Try to find t.me or tg:// links in description
+        const tgMatch = description.match(/(?:t\.me|telegram\.me)\/([a-zA-Z0-9_]{3,})/i)
+                     || description.match(/tg:\/\/resolve\?domain=([a-zA-Z0-9_]{3,})/i)
+                     || description.match(/tg:\/\/join\?invite=([a-zA-Z0-9_]+)/i);
+        if (tgMatch) {
+          telegramUrl = tgMatch[0].startsWith("tg://") ? tgMatch[0] : `https://t.me/${tgMatch[1]}`;
+          username = tgMatch[1];
+          extractionStatus = "success";
+        } else {
+          extractionStatus = "pending";
+        }
+      }
+
+      if (title && detailUrl && !results.some(r => r.detailUrl === detailUrl)) {
+        results.push({
+          title,
+          description: description || "No description provided.",
+          subscribers,
+          detailUrl,
+          imageUrl: imageUrl || null,
+          source,
+          telegramUrl,
+          username,
+          extractionStatus,
+          chatType: detectChatType(telegramUrl, title, description, detailUrl, subscribers)
+        });
+      }
+    });
+
+    // Also check detail page format (.channel-detail) — used when fetching individual channel pages
+    const $detail = $(".channel-detail");
+    if ($detail.length > 0 && results.length === 0) {
+      const $titleLink = $detail.find(".channel-detail__title a").first();
+      const href = $titleLink.attr("href") || "";
+      const title = $titleLink.text().trim();
+
+      let subscribers: string | null = null;
+      $detail.find(".channel-detail__options li").each((_, li) => {
+        const text = $(li).text().trim();
+        if (text.match(/\d/) && !text.startsWith("@")) {
+          subscribers = text.replace(/\s+/g, " ").trim();
+        }
+      });
+
+      let username: string | null = null;
+      const optionsLis = $detail.find(".channel-detail__options li");
+      if (optionsLis.length >= 2) {
+        const uText = $(optionsLis[1]).text().trim();
+        if (uText.startsWith("@")) {
+          username = uText.substring(1);
+        }
+      }
+
+      const description = $detail.find(".channel-detail__description").first().text().trim();
+      const imageUrl = resolveUrl($detail.find(".channel-detail__media img").attr("src") || "");
+
+      let telegramUrl: string | null = null;
+      let extractionStatus: string = "pending";
+      // The title link itself is tg://resolve?domain=...
+      if (href.startsWith("tg://")) {
+        telegramUrl = href;
+        extractionStatus = "success";
+        if (href.includes("domain=")) username = href.split("domain=")[1];
+        else if (href.includes("invite=")) username = href.split("invite=")[1];
+      } else if (username) {
+        telegramUrl = `https://t.me/${username}`;
+        extractionStatus = "success";
+      }
+
+      if (title && !results.some(r => r.title === title)) {
+        results.push({
+          title,
+          description: description || "No description provided.",
+          subscribers,
+          detailUrl: resolveUrl($(".channel-detail__link a.app").attr("href") || href),
+          imageUrl: imageUrl || null,
+          source,
+          telegramUrl,
+          username,
+          extractionStatus,
+          chatType: detectChatType(telegramUrl, title, description, "", subscribers)
+        });
+      }
+    }
+
+    return results;
+  }
+
+  // ── tgramcat-specific parser ──
+  if (source === "tgramcat") {
+    // Search results: each card is .col > .border.rounded.bg-body.p-2 containing a[href="/channel/<numeric_id>"]
+    // Structure: img.rounded-circle + a[href="/channel/..."] (title) + .text-muted (subs • @username) + div (description)
+    
+    $(".col").each((_, el) => {
+      const $card = $(el);
+      const $border = $card.find(".border.rounded.bg-body.p-2");
+      if ($border.length === 0) return;
+
+      // Must have a link to /channel/<numeric_id> — NOT /account/channel/add or similar
+      const $titleLink = $border.find("a").filter((_, a) => {
+        const href = $(a).attr("href") || "";
+        return /^\/channel\/\d+/.test(href);
+      }).first();
+      if ($titleLink.length === 0) return;
+
+      const href = $titleLink.attr("href") || "";
+      const detailUrl = resolveUrl(href);
+      const title = $titleLink.text().trim();
+
+      // Extract subs + username from .text-muted: "👤 478 • @sozrelvopross"
+      let subscribers: string | null = null;
+      let username: string | null = null;
+      $border.find(".text-muted").each((_, el) => {
+        const text = $(el).text().trim();
+        if (text.includes("•")) {
+          const subsMatch = text.match(/(\d[\d\s.,]*)\s*•/);
+          if (subsMatch) subscribers = subsMatch[1].trim();
+          const userMatch = text.match(/@([a-zA-Z0-9_]+)/);
+          if (userMatch) username = userMatch[1];
+        }
+      });
+
+      // Description: div inside .d-flex > div:last-child that is NOT .text-muted, NOT title link, NOT img
+      let description = "";
+      const $textContainer = $border.find(".d-flex > div:last-child");
+      if ($textContainer.length > 0) {
+        $textContainer.children("div").each((_, d) => {
+          const $d = $(d);
+          if (!$d.hasClass("text-muted") && $d.find("a").length === 0 && $d.find("img").length === 0) {
+            const text = $d.text().trim();
+            if (text.length > 3) description = text;
+          }
+        });
+      }
+
+      const imageUrl = resolveUrl($border.find("img").attr("src") || "");
+
+      // Don't build telegram URL from username here — let detail page fetch confirm it
+      let telegramUrl: string | null = null;
+      let extractionStatus: string = "pending";
+
+      if (title && detailUrl && !results.some(r => r.detailUrl === detailUrl)) {
+        results.push({
+          title,
+          description: description || "No description provided.",
+          subscribers,
+          detailUrl,
+          imageUrl: imageUrl || null,
+          source,
+          telegramUrl,
+          username,
+          extractionStatus,
+          chatType: detectChatType(telegramUrl, title, description, detailUrl, subscribers)
+        });
+      }
+    });
+
+    // Detail page: h1 with channel info (only if no search results found)
+    const $h1 = $("h1.font-family-ua-brand, h1.h2");
+    if ($h1.length > 0 && results.length === 0) {
+      const title = $h1.first().text().trim();
+      
+      let subscribers: string | null = null;
+      let username: string | null = null;
+      const $meta = $(".mb-3.text-muted").first();
+      if ($meta.length > 0) {
+        const metaText = $meta.text().trim();
+        const subsMatch = metaText.match(/(\d[\d\s.,]*)\s*•/);
+        if (subsMatch) subscribers = subsMatch[1].trim();
+        const userMatch = metaText.match(/@([a-zA-Z0-9_]+)/);
+        if (userMatch) username = userMatch[1];
+      }
+
+      const description = $(".mb-3.fs-5").first().text().trim();
+      
+      // Telegram link from "Открыть" button
+      let telegramUrl: string | null = null;
+      let extractionStatus: string = "pending";
+      $("a.btn").each((_, el) => {
+        const href = $(el).attr("href") || "";
+        if (/t\.me\//i.test(href)) {
+          telegramUrl = href;
+          extractionStatus = "success";
+          return false;
+        }
+      });
+      if (!telegramUrl && username) {
+        telegramUrl = `https://t.me/${username}`;
+        extractionStatus = "success";
+      }
+
+      const imageUrl = resolveUrl($(".channel-header img").attr("src") || "");
+      const detailUrl = $("link[rel='canonical']").attr("href") || "";
+
+      if (title) {
+        results.push({
+          title,
+          description: description || "No description provided.",
+          subscribers,
+          detailUrl,
+          imageUrl: imageUrl || null,
+          source,
+          telegramUrl,
+          username,
+          extractionStatus,
+          chatType: detectChatType(telegramUrl, title, description, detailUrl, subscribers)
+        });
+      }
+    }
+
+    return results;
+  }
+
+  // ── tgramsearch-specific parser ──
+  if (source === "tgramsearch") {
+    // Each card: .tg-channel
+    // Title: .tg-channel__link a[href="/join/<id>"]
+    // Subscribers: .tg-stat__user-count (just the number)
+    // Description: .tg-channel__description
+    // Type: .tg-option--public (публичный) or .tg-option--private (приватный)
+    // Image: .tg-channel__avatar img
+
+    $(".tg-channel").each((_, el) => {
+      const $card = $(el);
+      
+      const $link = $card.find(".tg-channel__link a").first();
+      const href = $link.attr("href") || "";
+      if (!href.includes("/join/") && !href.includes("/channel/")) return;
+
+      const detailUrl = resolveUrl(href);
+      const title = $link.text().trim();
+      if (!title) return;
+
+      // Subscribers: just the number from .tg-stat__user-count
+      const subsText = $card.find(".tg-stat__user-count").first().text().trim();
+      let subscribers: string | null = null;
+      if (subsText) {
+        const num = parseInt(subsText, 10);
+        if (!isNaN(num)) {
+          subscribers = num.toLocaleString("en-US"); // format with commas: 72707 -> 72,707
+        }
+      }
+
+      const description = $card.find(".tg-channel__description").first().text().trim();
+      const imageUrl = resolveUrl($card.find(".tg-channel__avatar img").attr("src") || "");
+
+      // Chat type from option class
+      const isPrivate = $card.find(".tg-option--private").length > 0;
+
+      // On search results page, there's NO direct tg:// link — it's on the detail page
+      // Mark as pending; detail page fetch will resolve the actual link
+      let telegramUrl: string | null = null;
+      let username: string | null = null;
+      let extractionStatus: string = "pending";
+
+      if (title && detailUrl && !results.some(r => r.detailUrl === detailUrl)) {
+        results.push({
+          title,
+          description: description || "No description provided.",
+          subscribers,
+          detailUrl,
+          imageUrl: imageUrl || null,
+          source,
+          telegramUrl,
+          username,
+          extractionStatus,
+          chatType: isPrivate ? "closed" : detectChatType(telegramUrl, title, description, detailUrl, subscribers)
+        });
+      }
+    });
+
+    return results;
+  }
+
+  // ── Generic parser for other sources ──
   const selectors = [
     ".card", ".channel-card", ".search-item", ".list-group-item",
     ".item", ".channel", ".grid-item", "article", ".box",
@@ -430,7 +752,7 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
         batchPages.push(page + i);
       }
 
-      logs.push(`[Pagination Engine] Fetching ${src} batch: pages ${batchPages.join(", ")}`);
+      logs.push(`[Scanning] ${src} — pages ${batchPages[0]}–${batchPages[batchPages.length - 1]} of ~${maxPages}...`);
 
       try {
         const batchResults: any[] = [];
@@ -508,6 +830,111 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
                }
             }
 
+            // tgsearch: fetch detail pages (/channel/<id>) to extract tg://resolve or tg://join links + username + subs
+            if (src === "tgsearch" && parsedResults.length > 0) {
+               const chunkSize = 5;
+               for (let i = 0; i < parsedResults.length; i += chunkSize) {
+                 const chunk = parsedResults.slice(i, i + chunkSize);
+                 logs.push(`[Extraction] Fetching detail pages ${i + 1}–${Math.min(i + chunkSize, parsedResults.length)} of ${parsedResults.length}...`);
+                 await Promise.all(chunk.map(async (r: any) => {
+                   if (r.detailUrl && r.detailUrl.includes("/channel/")) {
+                     try {
+                       const controller = new AbortController();
+                       const timeoutId = setTimeout(() => controller.abort(), 5000);
+                       const detRes = await fetch(r.detailUrl, {
+                         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+                         signal: controller.signal
+                       });
+                       clearTimeout(timeoutId);
+                       if (detRes.ok) {
+                          const dhtml = await detRes.text();
+                          const $d = cheerio.load(dhtml);
+                          // Extract from .channel-detail__title a (tg://resolve?domain=...)
+                          const titleLink = $d(".channel-detail__title a").attr("href") || "";
+                          if (titleLink.startsWith("tg://")) {
+                            r.telegramUrl = titleLink;
+                            r.extractionStatus = "success";
+                            if (titleLink.includes("domain=")) r.username = titleLink.split("domain=")[1];
+                            else if (titleLink.includes("invite=")) r.username = titleLink.split("invite=")[1];
+                          }
+                          // Extract subscribers from .channel-detail__options li
+                          if (!r.subscribers || r.subscribers === "N/A") {
+                            $d(".channel-detail__options li").each((_, li) => {
+                              const text = $d(li).text().trim();
+                              if (text.match(/\d/) && !text.startsWith("@")) {
+                                r.subscribers = text.replace(/\s+/g, " ").trim();
+                              }
+                            });
+                          }
+                          // Extract username from .channel-detail__options li (second item)
+                          if (!r.username) {
+                            const optionsLis = $d(".channel-detail__options li");
+                            if (optionsLis.length >= 2) {
+                              const uText = $d(optionsLis[1]).text().trim();
+                              if (uText.startsWith("@")) r.username = uText.substring(1);
+                            }
+                          }
+                          // Fallback: regex scan for tg:// links
+                          if (!r.telegramUrl) {
+                            const tgMatch = dhtml.match(/tg:\/\/resolve\?domain=([a-zA-Z0-9_]{3,})/i)
+                                         || dhtml.match(/tg:\/\/join\?invite=([a-zA-Z0-9_]+)/i);
+                            if (tgMatch) {
+                              r.telegramUrl = tgMatch[0];
+                              r.username = tgMatch[1];
+                              r.extractionStatus = "success";
+                            }
+                          }
+                       }
+                     } catch (e) {
+                       // ignore timeouts
+                     }
+                   }
+                 }));
+               }
+            }
+
+            // tgramcat: ALWAYS fetch detail pages to get t.me link from "Открыть" button
+            if (src === "tgramcat" && parsedResults.length > 0) {
+               const chunkSize = 5;
+               for (let i = 0; i < parsedResults.length; i += chunkSize) {
+                 const chunk = parsedResults.slice(i, i + chunkSize);
+                 logs.push(`[Extraction] Fetching detail pages ${i + 1}–${Math.min(i + chunkSize, parsedResults.length)} of ${parsedResults.length}...`);
+                 await Promise.all(chunk.map(async (r: any) => {
+                   if (r.detailUrl && r.detailUrl.includes("/channel/")) {
+                     try {
+                       const controller = new AbortController();
+                       const timeoutId = setTimeout(() => controller.abort(), 5000);
+                       const detRes = await fetch(r.detailUrl, {
+                         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+                         signal: controller.signal
+                       });
+                       clearTimeout(timeoutId);
+                       if (detRes.ok) {
+                          const dhtml = await detRes.text();
+                          // Look for t.me link in "Открыть" button: a.btn.btn-dark[href="https://t.me/..."]
+                          const tMeMatch = dhtml.match(/href="(https?:\/\/t\.me\/[a-zA-Z0-9_+]+)"/i);
+                          if (tMeMatch) {
+                            r.telegramUrl = tMeMatch[1];
+                            r.extractionStatus = "success";
+                            const userMatch = tMeMatch[1].match(/t\.me\/([a-zA-Z0-9_]+)/i);
+                            if (userMatch) r.username = userMatch[1];
+                          }
+                          // Also extract subs from detail page if missing
+                          if (!r.subscribers || r.subscribers === "N/A") {
+                            const $d = cheerio.load(dhtml);
+                            const metaText = $d(".mb-3.text-muted").first().text().trim();
+                            const subsMatch = metaText.match(/(\d[\d\s.,]*)\s*•/);
+                            if (subsMatch) r.subscribers = subsMatch[1].trim();
+                          }
+                       }
+                     } catch (e) {
+                       // ignore timeouts
+                     }
+                   }
+                 }));
+               }
+            }
+
             let rawCardCount = 0;
             if (html) {
               const $ = cheerio.load(html);
@@ -516,6 +943,8 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
                 cardSelector = ".search-result";
               } else if (src === "tgramsearch") {
                 cardSelector = ".tg-channel";
+              } else if (src === "tgramcat") {
+                cardSelector = ".col:has(a[href^='/channel/'])";
               }
               rawCardCount = Math.max(
                 parsedResults.length,
@@ -548,7 +977,7 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
 
           if (isPageEmpty) {
             consecutiveEmptyPages++;
-            logs.push(`[Pagination Engine] Page ${pageRes.page} of ${src} returned 0 results. (Consecutive empty: ${consecutiveEmptyPages})`);
+            logs.push(`[Scanning] Page ${pageRes.page}: empty (${consecutiveEmptyPages} consecutive empty)`);
             continue;
           }
 
@@ -566,7 +995,18 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
           searchStats[src].tgLinksFound = (searchStats[src].tgLinksFound || 0) + tgLinksCount;
 
           for (const item of pageRes.results) {
-            const dupKey = `${item.title.toLowerCase()}_${item.detailUrl.toLowerCase()}`;
+            // Dedup by username or Telegram link — not by title (titles can repeat)
+            let dupKey = "";
+            if (item.username) {
+              dupKey = `user:${item.username.toLowerCase()}`;
+            } else if (item.telegramUrl) {
+              const m = item.telegramUrl.match(/(?:t\.me|telegram\.me|domain=|invite=)([a-zA-Z0-9_+-]+)/i);
+              dupKey = m ? `link:${m[1].toLowerCase()}` : `url:${item.telegramUrl.toLowerCase()}`;
+            } else if (item.detailUrl) {
+              dupKey = `detail:${item.detailUrl.toLowerCase()}`;
+            } else {
+              dupKey = `title:${item.title.toLowerCase()}`;
+            }
             if (!seenTitlesAndUrls.has(dupKey)) {
               seenTitlesAndUrls.add(dupKey);
               uniqueOnPage++;
@@ -581,15 +1021,18 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
             newResultsInBatchCount += uniqueOnPage;
             searchStats[src].uniqueAdded += uniqueOnPage;
           } else {
-            logs.push(`[Pagination Engine] Page ${pageRes.page} of ${src} has only duplicates.`);
-            // Note: we don't immediately abort if we got duplicates because subsequent pages might still have unique content
+            logs.push(`[Scanning] Page ${pageRes.page}: all results are duplicates`);
           }
         }
 
-        logs.push(`[Pagination Engine] Batch results: ${newResultsInBatchCount} unique channels added from ${src} (Pages ${batchPages.join("-")})`);
+        logs.push(`[Scanning] ${src} batch done: +${newResultsInBatchCount} new, ${searchStats[src].duplicatesFiltered} dupes removed (total: ${searchStats[src].uniqueAdded})`);
 
         if (consecutiveEmptyPages >= 3 || allPagesInBatchEmpty) {
-          logs.push(`[Pagination Engine] Reached end of directory or reached consecutive empty page limit (consecutive empty: ${consecutiveEmptyPages}). Stopping ${src}.`);
+          logs.push(`[Scanning] ${src}: end of directory reached (3+ empty pages). Stopping.`);
+          hasMore = false;
+        } else if (newResultsInBatchCount === 0 && !allPagesInBatchEmpty) {
+          // All pages returned results but every result was a duplicate — site re-serves same content on every page
+          logs.push(`[Scanning] ${src}: only duplicates in batch. End of unique content. Stopping.`);
           hasMore = false;
         } else {
           page += batchSize;
