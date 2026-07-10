@@ -4,8 +4,19 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import * as cheerio from "cheerio";
 import dotenv from "dotenv";
+import { setGlobalDispatcher, ProxyAgent } from "undici";
 
 dotenv.config();
+
+// Node's fetch (undici) does NOT read the OS-level system proxy that browsers use
+// automatically — a VPN configured system-wide (e.g. via `scutil --proxy` on macOS)
+// is invisible to it unless explicitly wired up here. Without this, sites reachable
+// in the browser can silently fail to connect (UND_ERR_CONNECT_TIMEOUT) from Node.
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
+if (proxyUrl) {
+  setGlobalDispatcher(new ProxyAgent(proxyUrl));
+  console.log(`[Network] Routing outbound requests through proxy: ${proxyUrl}`);
+}
 
 const app = express();
 const PORT = 3000;
@@ -628,14 +639,26 @@ function parseWithSelectors(html: string, source: string, baseUrl: string): any[
   return results;
 }
 
+const CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 // Helper to make a fetch request with randomized mobile/desktop browser headers and automatic retry
-async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000): Promise<string> {
+async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000, extraHeaders: Record<string, string> = {}): Promise<string> {
   const headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": CHROME_USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    ...extraHeaders,
   };
 
   for (let attempt = 1; attempt <= retries + 1; attempt++) {
@@ -653,15 +676,43 @@ async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000): Promi
       }
       return await response.text();
     } catch (error: any) {
-      console.warn(`[Fetch Attempt ${attempt}/${retries + 1}] Failed for ${url}: ${error.message}`);
+      // error.message alone is often just "fetch failed" — undici puts the real
+      // reason (DNS failure, TLS error, ECONNREFUSED, timeout, ...) on error.cause.
+      const causeDetail = error.cause ? ` — cause: ${error.cause.code || error.cause.message || error.cause}` : "";
+      console.warn(`[Fetch Attempt ${attempt}/${retries + 1}] Failed for ${url}: ${error.message}${causeDetail}`);
       if (attempt <= retries) {
         await new Promise(r => setTimeout(r, delayMs * attempt));
       } else {
-        throw new Error(`Failed to fetch page content after ${retries + 1} attempts: ${error.message}`);
+        throw new Error(`Failed to fetch page content after ${retries + 1} attempts: ${error.message}${causeDetail}`);
       }
     }
   }
   throw new Error("Failed to fetch page content: unknown error");
+}
+
+// Some catalogs (e.g. tgramsearch) gate real content behind a session cookie issued on first visit —
+// a plain stateless fetch to a deep search URL can come back "200 OK" but with an empty/placeholder body.
+// Warm up by hitting the homepage first and carry its Set-Cookie into subsequent requests.
+async function fetchSessionCookie(baseUrl: string, logs?: string[]): Promise<string> {
+  try {
+    const res = await fetch(baseUrl, {
+      headers: {
+        "User-Agent": CHROME_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    const getSetCookie = (res.headers as any).getSetCookie;
+    const cookies: string[] = typeof getSetCookie === "function"
+      ? getSetCookie.call(res.headers)
+      : (res.headers.get("set-cookie") ? [res.headers.get("set-cookie") as string] : []);
+    return cookies.map(c => c.split(";")[0]).join("; ");
+  } catch (e: any) {
+    const causeDetail = e.cause ? ` — cause: ${e.cause.code || e.cause.message || e.cause}` : "";
+    console.warn(`[Session Warmup] Failed to fetch session cookie for ${baseUrl}: ${e.message}${causeDetail}`);
+    logs?.push(`[Session] Warmup request to ${baseUrl} threw: ${e.message}${causeDetail}`);
+    return "";
+  }
 }
 
 // ---------------- API ENDPOINTS ----------------
@@ -729,6 +780,7 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
 
   logs.push(`Starting automated deep search across sources: [${sources.join(", ")}] for "${query}"...`);
 
+  try {
   for (const src of sources) {
     searchStats[src] = {
       pagesFetched: 0,
@@ -743,6 +795,19 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
     const batchSize = 5; // Parallel/sequential stagger batch size to stay fast but be respectful
     const maxPages = limitPages ? parseInt(limitPages as string, 10) : 500; // Customizable limit, default to 500
     const seenTitlesAndUrls = new Set<string>();
+
+    // tgramsearch gates real content behind a session cookie issued on the homepage —
+    // a stateless request to a deep search URL can silently come back with an empty page.
+    let sessionCookie = "";
+    if (src === "tgramsearch") {
+      sessionCookie = await fetchSessionCookie(getBaseUrlForSource(src), logs);
+      logs.push(sessionCookie
+        ? `[Session] tgramsearch: session cookie acquired from homepage warmup.`
+        : `[Session] tgramsearch: homepage warmup returned no cookie — proceeding without one.`);
+    }
+    const srcExtraHeaders: Record<string, string> = src === "tgramsearch"
+      ? { Referer: `${getBaseUrlForSource(src)}/`, ...(sessionCookie ? { Cookie: sessionCookie } : {}) }
+      : {};
 
     logs.push(`[Pagination Engine] Commencing automated paging for ${src} (limit: ${maxPages} pages)`);
 
@@ -769,13 +834,13 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
           }
 
           try {
-            const html = await fetchWithHeaders(searchUrl, 2, 1000); // 2 retries with 1000ms delay
+            const html = await fetchWithHeaders(searchUrl, 2, 1000, srcExtraHeaders); // 2 retries with 1000ms delay
             const baseUrl = getBaseUrlForSource(src);
             let parsedResults: any[] = [];
 
             if (mode === "fast") {
               parsedResults = parseWithSelectors(html, src, baseUrl);
-              
+
               if (parsedResults.length === 0 && p === 1 && process.env.GEMINI_API_KEY) {
                 logs.push(`[Fallback] Page 1 selectors empty on ${src}. Trying smart AI parser...`);
                 try {
@@ -794,31 +859,60 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
               }
             }
 
+            // Diagnostic: if tgramsearch returns zero cards, capture a snippet of what we actually
+            // received so the next run shows *why* (bot-challenge page, empty shell, etc.) instead
+            // of just "0 results" with no further clue.
+            if (src === "tgramsearch" && parsedResults.length === 0) {
+              const snippet = html.replace(/\s+/g, " ").trim().slice(0, 220);
+              logs.push(`[Diagnostic] tgramsearch page ${p}: 0 cards parsed, HTML length=${html.length}. Snippet: "${snippet}"`);
+            }
+
+            // tgramsearch: fetch detail pages (/join/<id>) to extract tg://resolve or tg://join links + username
             if (src === "tgramsearch" && parsedResults.length > 0) {
                const chunkSize = 5;
                for (let i = 0; i < parsedResults.length; i += chunkSize) {
                  const chunk = parsedResults.slice(i, i + chunkSize);
+                 logs.push(`[Extraction] Fetching detail pages ${i + 1}–${Math.min(i + chunkSize, parsedResults.length)} of ${parsedResults.length}...`);
                  await Promise.all(chunk.map(async (r: any) => {
                    if (r.detailUrl && r.detailUrl.includes("/join/")) {
                      try {
                        const controller = new AbortController();
-                       const timeoutId = setTimeout(() => controller.abort(), 3000);
+                       const timeoutId = setTimeout(() => controller.abort(), 5000);
                        const detRes = await fetch(r.detailUrl, {
-                         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+                         headers: { "User-Agent": CHROME_USER_AGENT, ...srcExtraHeaders },
                          signal: controller.signal
                        });
                        clearTimeout(timeoutId);
                        if (detRes.ok) {
                           const dhtml = await detRes.text();
                           const $d = cheerio.load(dhtml);
-                          const btnHref = $d(".tg-channel__btn a").attr("href");
-                          if (btnHref && (btnHref.startsWith("tg://") || btnHref.includes("t.me/"))) {
+                          // Primary: scan every <a> on the page for a tg://resolve or tg://join link —
+                          // not tied to a specific button class, since that markup isn't guaranteed.
+                          let btnHref: string | undefined;
+                          $d("a").each((_, el) => {
+                            const href = $d(el).attr("href") || "";
+                            if (href.startsWith("tg://resolve?domain=") || href.startsWith("tg://join?invite=")) {
+                              btnHref = href;
+                              return false; // break
+                            }
+                          });
+                          if (btnHref) {
                              r.telegramUrl = btnHref;
                              r.extractionStatus = "success";
                              if (btnHref.includes("resolve?domain=")) {
                                  r.username = btnHref.split("domain=")[1];
                              } else if (btnHref.includes("join?invite=")) {
                                  r.username = btnHref.split("invite=")[1];
+                             }
+                          } else {
+                             // Fallback: regex scan raw HTML for tg:// links (covers links embedded
+                             // outside of <a> tags, e.g. in inline onclick handlers or data attributes)
+                             const tgMatch = dhtml.match(/tg:\/\/resolve\?domain=([a-zA-Z0-9_]{3,})/i)
+                                          || dhtml.match(/tg:\/\/join\?invite=([a-zA-Z0-9_]+)/i);
+                             if (tgMatch) {
+                               r.telegramUrl = tgMatch[0];
+                               r.username = tgMatch[1];
+                               r.extractionStatus = "success";
                              }
                           }
                        }
@@ -1043,6 +1137,14 @@ app.post("/api/search", async (req: express.Request, res: express.Response) => {
         hasMore = false;
       }
     }
+  }
+  } catch (fatalErr: any) {
+    // Without this, an uncaught error anywhere in the loop above (e.g. a source's
+    // session-cookie warmup or an unexpected parser throw) would leave the request
+    // hanging with no response — and every log line collected so far would be lost,
+    // since res.json() below is the only place logs are ever sent to the client.
+    console.error(`[Fatal] /api/search crashed while processing sources:`, fatalErr);
+    logs.push(`[Fatal Error] Search crashed: ${fatalErr.message || fatalErr}. Returning partial results collected so far.`);
   }
 
   res.json({ results, logs, searchStats });

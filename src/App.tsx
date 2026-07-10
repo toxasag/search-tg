@@ -84,6 +84,22 @@ export default function App() {
     localStorage.setItem("scraped_channels", JSON.stringify(updatedChannels));
   };
 
+  // Always-fresh mirror of `channels`, used by async flows (extractLink, bulk queue)
+  // so they never act on a stale closure snapshot of the array.
+  const channelsRef = useRef<ScrapedChannel[]>(channels);
+  useEffect(() => {
+    channelsRef.current = channels;
+  }, [channels]);
+
+  // Functional update variant: reads/writes the latest state instead of a captured `channels` closure.
+  const updateChannels = (updater: (prev: ScrapedChannel[]) => ScrapedChannel[]) => {
+    setChannels((prev) => {
+      const next = updater(prev);
+      localStorage.setItem("scraped_channels", JSON.stringify(next));
+      return next;
+    });
+  };
+
   // Save history to LocalStorage
   const saveHistory = (updatedHistory: SearchQueryHistory[]) => {
     setHistory(updatedHistory);
@@ -272,14 +288,13 @@ export default function App() {
 
   // Perform single Telegram link extraction
   const extractLink = async (channelId: string) => {
-    const channel = channels.find((c) => c.id === channelId);
+    const channel = channelsRef.current.find((c) => c.id === channelId);
     if (!channel) return;
 
     // Update state to extracting
-    const updatedWithLoading = channels.map((c) => 
+    updateChannels((prev) => prev.map((c) =>
       c.id === channelId ? { ...c, extractionStatus: "extracting" as const } : c
-    );
-    saveChannels(updatedWithLoading);
+    ));
     addLog(`[Extraction] Launching parser for "${channel.title}" (${channel.source})...`);
 
     try {
@@ -303,39 +318,36 @@ export default function App() {
 
       if (data.success && data.telegramUrl) {
         addLog(`[Extraction] Success! Found Telegram link for "${channel.title}": ${data.telegramUrl}`);
-        const finalChannels = channels.map((c) => 
-          c.id === channelId ? { 
-            ...c, 
+        updateChannels((prev) => prev.map((c) =>
+          c.id === channelId ? {
+            ...c,
             telegramUrl: data.telegramUrl,
             username: data.username,
             channelDescription: data.channelDescription,
             stats: data.stats,
             similarChannels: data.similarChannels || null,
-            extractionStatus: "success" as const 
+            extractionStatus: "success" as const
           } : c
-        );
-        saveChannels(finalChannels);
+        ));
       } else {
         addLog(`[Extraction] Warning: No Telegram link found on catalog page for "${channel.title}".`);
-        const finalChannels = channels.map((c) => 
-          c.id === channelId ? { 
-            ...c, 
+        updateChannels((prev) => prev.map((c) =>
+          c.id === channelId ? {
+            ...c,
             extractionStatus: "failed" as const,
             error: "No link found on page"
           } : c
-        );
-        saveChannels(finalChannels);
+        ));
       }
     } catch (err: any) {
       addLog(`[Extraction] Error extracting link for "${channel.title}": ${err.message}`);
-      const finalChannels = channels.map((c) => 
-        c.id === channelId ? { 
-          ...c, 
+      updateChannels((prev) => prev.map((c) =>
+        c.id === channelId ? {
+          ...c,
           extractionStatus: "failed" as const,
           error: err.message
         } : c
-      );
-      saveChannels(finalChannels);
+      ));
     }
   };
 
@@ -350,7 +362,7 @@ export default function App() {
     }
 
     const nextId = bulkQueue[currentBulkIndex];
-    const channel = channels.find(c => c.id === nextId);
+    const channel = channelsRef.current.find(c => c.id === nextId);
 
     if (!channel || channel.extractionStatus === "success") {
       // Skip if already success
@@ -360,13 +372,17 @@ export default function App() {
 
     // Process the next channel after the defined rate-limit delay
     const timer = setTimeout(async () => {
-      addLog(`[Bulk Engine] Processing queue item ${currentBulkIndex + 1}/${bulkQueue.length}: "${channel.title}"`);
+      const current = channelsRef.current.find(c => c.id === nextId);
+      addLog(`[Bulk Engine] Processing queue item ${currentBulkIndex + 1}/${bulkQueue.length}: "${current?.title ?? nextId}"`);
       await extractLink(nextId);
       setCurrentBulkIndex(prev => prev + 1);
     }, bulkDelay);
 
     return () => clearTimeout(timer);
-  }, [isExtractingBulk, bulkQueue, currentBulkIndex, channels]);
+    // NOTE: `channels` is intentionally excluded — extractLink() mutates channels mid-flight,
+    // and re-running this effect on every such mutation would reschedule/duplicate the timer
+    // for the same queue index (see bug: index skipping / duplicate extraction requests).
+  }, [isExtractingBulk, bulkQueue, currentBulkIndex, bulkDelay]);
 
   // Start Bulk Extraction for all filtered/pending channels
   const startBulkExtraction = () => {
