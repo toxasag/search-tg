@@ -3,14 +3,25 @@ import {
   Search, Globe, Database, Cpu, Settings, Play, ArrowDownToLine, 
   RefreshCw, CheckCircle, XCircle, AlertCircle, Copy, Check, 
   ExternalLink, Trash2, ListFilter, HelpCircle, Info, ChevronRight,
-  Eye, FileSpreadsheet, FileJson, Layers, MessageSquare, Lock, Hash, Users, BookOpen
+  Eye, FileSpreadsheet, FileJson, FileText, Layers, MessageSquare, Lock, Hash, Users, BookOpen, LogOut, ShieldCheck
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { ScrapedChannel, SearchQueryHistory, ParseMode, SearchSource, SearchStats } from "./types";
+import { CurrentUser, ScrapedChannel, SearchQueryHistory, ParseMode, SearchSource, SearchStats } from "./types";
 import Header from "./components/Header";
 import LogsPanel from "./components/LogsPanel";
+import AuthScreen from "./components/AuthScreen";
+import OwnerPanel from "./components/OwnerPanel";
+import ChangePasswordPanel from "./components/ChangePasswordPanel";
+import SearchTips from "./components/SearchTips";
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [needsBootstrap, setNeedsBootstrap] = useState(false);
+  const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
+  const [activeSearchStatus, setActiveSearchStatus] = useState<any | null>(null);
+  const [isOwnerPanelOpen, setIsOwnerPanelOpen] = useState(false);
+
   // Scraper State
   const [query, setQuery] = useState("");
   const [source, setSource] = useState<SearchSource>("all");
@@ -23,10 +34,7 @@ export default function App() {
   const [lastDuplicateCount, setLastDuplicateCount] = useState<number>(0);
   
   // Last search stats
-  const [lastSearchStats, setLastSearchStats] = useState<SearchStats | null>(() => {
-    const saved = localStorage.getItem("last_search_stats");
-    return saved ? JSON.parse(saved) : null;
-  });
+  const [lastSearchStats, setLastSearchStats] = useState<SearchStats | null>(null);
 
   // Filters & Searching inside Scraped Results
   const [textFilter, setTextFilter] = useState("");
@@ -52,37 +60,92 @@ export default function App() {
   // Clipboard Copied Indicator State
   const [copiedAll, setCopiedAll] = useState(false);
   const [copiedChannelId, setCopiedChannelId] = useState<string | null>(null);
+  const [importSummary, setImportSummary] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState(0);
   const [isConfirmingClear, setIsConfirmingClear] = useState(false);
 
   // Check if GEMINI_API_KEY is available in metadata or backend
   const [apiKeyMissing, setApiKeyMissing] = useState(false);
 
-  // Load state from LocalStorage on mount
-  useEffect(() => {
-    const savedChannels = localStorage.getItem("scraped_channels");
-    if (savedChannels) {
-      try {
-        setChannels(JSON.parse(savedChannels));
-      } catch (e) {
-        console.error("Failed to parse saved channels", e);
-      }
-    }
+  // Load the authenticated user's persisted workspace.
+  const loadSearches = async () => {
+    const response = await fetch("/api/searches");
+    if (!response.ok) return;
+    const data = await response.json();
+    setHistory(data.searches.map((search: any) => ({
+      id: search.id,
+      query: search.query,
+      source: search.source,
+      mode: search.mode,
+      limitPages: search.limitPages,
+      status: search.status,
+      resultCount: search.resultCount,
+      timestamp: search.createdAt,
+    })));
+  };
 
-    const savedHistory = localStorage.getItem("scraped_history");
-    if (savedHistory) {
-      try {
-        setHistory(JSON.parse(savedHistory));
-      } catch (e) {
-        console.error("Failed to parse saved history", e);
-      }
-    }
+  const loadSearch = async (searchId: string) => {
+    const response = await fetch(`/api/searches/${searchId}`);
+    if (!response.ok) throw new Error("Saved search could not be loaded.");
+    const data = await response.json();
+    setActiveSearchId(data.id);
+    setQuery(data.query);
+    setSource(data.source);
+    setMode(data.mode);
+    setLimitPages(data.limitPages);
+    setChannels(data.results);
+    setLogs(data.logs || []);
+    setLastSearchStats(data.searchStats || null);
+  };
+
+  useEffect(() => {
+    fetch("/api/auth/me")
+      .then(async (response) => {
+        const data = await response.json();
+        setCurrentUser(data.user);
+        setNeedsBootstrap(Boolean(data.needsBootstrap));
+      })
+      .catch(() => setCurrentUser(null))
+      .finally(() => setIsAuthLoading(false));
   }, []);
 
-  // Save channels to LocalStorage whenever they change
-  const saveChannels = (updatedChannels: ScrapedChannel[]) => {
-    setChannels(updatedChannels);
-    localStorage.setItem("scraped_channels", JSON.stringify(updatedChannels));
-  };
+  useEffect(() => {
+    if (currentUser) void loadSearches();
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (!activeSearchId || !currentUser) return;
+    let stopped = false;
+    const refresh = async () => {
+      try {
+        const response = await fetch(`/api/searches/${activeSearchId}/status`);
+        if (!response.ok || stopped) return;
+        const status = await response.json();
+        setActiveSearchStatus(status);
+
+        // Fetch progressive results and logs dynamically
+        const saved = await fetch(`/api/searches/${activeSearchId}`);
+        if (saved.ok && !stopped) {
+          const data = await saved.json();
+          setChannels(data.results || []);
+          setLogs(data.logs || []);
+          if (data.searchStats) setLastSearchStats(data.searchStats);
+        }
+
+        if (["completed", "failed", "cancelled"].includes(status.status)) {
+          setIsSearching(false);
+          await loadSearches();
+          return;
+        }
+      } catch {}
+      if (!stopped) {
+        window.setTimeout(refresh, 1500);
+      }
+    };
+    void refresh();
+    return () => { stopped = true; };
+  }, [activeSearchId, currentUser]);
 
   // Always-fresh mirror of `channels`, used by async flows (extractLink, bulk queue)
   // so they never act on a stale closure snapshot of the array.
@@ -91,19 +154,9 @@ export default function App() {
     channelsRef.current = channels;
   }, [channels]);
 
-  // Functional update variant: reads/writes the latest state instead of a captured `channels` closure.
+  // Functional client update. Persistent writes are performed by protected API routes.
   const updateChannels = (updater: (prev: ScrapedChannel[]) => ScrapedChannel[]) => {
-    setChannels((prev) => {
-      const next = updater(prev);
-      localStorage.setItem("scraped_channels", JSON.stringify(next));
-      return next;
-    });
-  };
-
-  // Save history to LocalStorage
-  const saveHistory = (updatedHistory: SearchQueryHistory[]) => {
-    setHistory(updatedHistory);
-    localStorage.setItem("scraped_history", JSON.stringify(updatedHistory));
+    setChannels((prev) => updater(prev));
   };
 
   // Real-time logger wrapper
@@ -119,170 +172,31 @@ export default function App() {
     setIsSearching(true);
     setIsLogsOpen(true);
     setLastSearchStats(null);
-    localStorage.removeItem("last_search_stats");
-
-    const rawQueries = query.split(/[,;\n]+/).map(q => q.trim()).filter(Boolean);
-    if (rawQueries.length === 0) {
-      setIsSearching(false);
-      return;
-    }
-
-    addLog(`Initiating multi-query search for [${rawQueries.join(", ")}] on ${source === "all" ? "all directories" : source} using ${mode === "fast" ? "Fast Selector Mode" : "AI Scraper Mode"}...`);
+    setChannels([]);
+    setLogs([`[${new Date().toISOString()}] Initiating search for "${query.trim()}" across ${source === "all" ? "all directories" : source}...`]);
 
     try {
-      let accumulatedChannels: ScrapedChannel[] = [...channels];
-      const combinedStats: SearchStats = {};
-      let duplicatesTotal = 0;
+      const response = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: query.trim(), source, mode, limitPages, requestId: `${Date.now()}` }),
+      });
 
-      for (let i = 0; i < rawQueries.length; i++) {
-        const subQuery = rawQueries[i];
-        addLog(`[Engine] Running search query ${i + 1}/${rawQueries.length}: "${subQuery}"...`);
-
-        const response = await fetch("/api/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: subQuery, source, mode, limitPages }),
-        });
-
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          throw new Error(errorData.error || `HTTP error ${response.status}`);
-        }
-
-        const data = await response.json();
-        
-        // Merge stats if available
-        if (data.searchStats) {
-          Object.keys(data.searchStats).forEach((srcKey) => {
-            if (!combinedStats[srcKey]) {
-              combinedStats[srcKey] = { pagesFetched: 0, rawCardsFound: 0, totalFound: 0, tgLinksFound: 0, duplicatesFiltered: 0, uniqueAdded: 0 };
-            }
-            combinedStats[srcKey].pagesFetched += data.searchStats[srcKey].pagesFetched || 0;
-            combinedStats[srcKey].rawCardsFound = (combinedStats[srcKey].rawCardsFound || 0) + (data.searchStats[srcKey].rawCardsFound || 0);
-            combinedStats[srcKey].totalFound += data.searchStats[srcKey].totalFound || 0;
-            combinedStats[srcKey].tgLinksFound = (combinedStats[srcKey].tgLinksFound || 0) + (data.searchStats[srcKey].tgLinksFound || 0);
-            combinedStats[srcKey].duplicatesFiltered += data.searchStats[srcKey].duplicatesFiltered || 0;
-            combinedStats[srcKey].uniqueAdded += data.searchStats[srcKey].uniqueAdded || 0;
-
-            const st = data.searchStats[srcKey];
-            addLog(`[Report] Найдено ${st.rawCardsFound || st.totalFound} (из них ${st.tgLinksFound !== undefined ? st.tgLinksFound : st.totalFound} содержат t.me), уникальных: ${st.uniqueAdded} именно для ${srcKey}.`);
-          });
-        }
-
-        // Merge logs returned from backend
-        if (data.logs && Array.isArray(data.logs)) {
-          data.logs.forEach((backendLog: string) => addLog(`[Backend: "${subQuery}"] ${backendLog}`));
-        }
-
-        if (data.results && Array.isArray(data.results)) {
-          // Formulate new results
-          const newChannels: ScrapedChannel[] = data.results.map((item: any) => ({
-            id: `${item.source.replace(/[\s,]+/g, "-")}-${encodeURIComponent(item.detailUrl)}`,
-            title: item.title,
-            description: item.description,
-            subscribers: item.subscribers,
-            detailUrl: item.detailUrl,
-            imageUrl: item.imageUrl,
-            source: item.source,
-            telegramUrl: item.telegramUrl || null,
-            username: item.username || null,
-            channelDescription: item.channelDescription || null,
-            stats: item.stats || null,
-            extractionStatus: item.extractionStatus || "pending",
-            chatType: item.chatType || "unknown",
-            timestamp: new Date().toISOString(),
-          }));
-
-          addLog(`[Engine] Query "${subQuery}" retrieved ${newChannels.length} channel records.`);
-
-          // Deduplication & Merging engine
-          const getDeduplicationKey = (ch: ScrapedChannel): string => {
-            if (ch.telegramUrl) {
-              const m = ch.telegramUrl.match(/(?:t\.me|telegram\.me)\/([a-zA-Z0-9_]{3,})/i);
-              if (m) return m[1].toLowerCase();
-            }
-            const detailMatch = ch.detailUrl.match(/(?:\/(?:channel|group|chat|cat|catalog|c|g|show|tg|t)\/|@)([a-zA-Z0-9_]{3,100})/i);
-            if (detailMatch && detailMatch[1]) {
-              const u = detailMatch[1].toLowerCase();
-              const excluded = ["search", "about", "contact", "privacy", "terms", "faq", "help", "channels", "groups", "add", "catalog", "category", "categories", "en", "ru", "feedback", "show", "tg", "t", "pages", "page"];
-              if (!excluded.includes(u)) {
-                return u;
-              }
-            }
-            return "title_" + ch.title.toLowerCase().replace(/[^a-z0-9а-яё]/gi, "");
-          };
-
-          const mergedMap = new Map<string, ScrapedChannel>();
-
-          // Process current accumulated list first
-          accumulatedChannels.forEach((ch) => {
-            const key = getDeduplicationKey(ch);
-            mergedMap.set(key, ch);
-          });
-
-          // Merge new channels on top of accumulated ones
-          newChannels.forEach((ch) => {
-            const key = getDeduplicationKey(ch);
-            if (mergedMap.has(key)) {
-              duplicatesTotal++;
-              const existing = mergedMap.get(key)!;
-              const isExistingBetter = existing.extractionStatus === "success";
-              
-              const existingSources = (existing.source || "").split(",").map(s => s.trim());
-              const newSources = (ch.source || "").split(",").map(s => s.trim());
-              const combinedSources = Array.from(new Set([...existingSources, ...newSources])).filter(Boolean).join(", ");
-
-              mergedMap.set(key, {
-                ...existing,
-                ...ch,
-                extractionStatus: isExistingBetter ? "success" : ch.extractionStatus,
-                telegramUrl: existing.telegramUrl || ch.telegramUrl,
-                username: existing.username || ch.username,
-                channelDescription: existing.channelDescription || ch.channelDescription,
-                stats: existing.stats || ch.stats,
-                subscribers: existing.subscribers || ch.subscribers,
-                source: combinedSources,
-                chatType: ch.chatType && ch.chatType !== "unknown" ? ch.chatType : (existing.chatType || "unknown"),
-                timestamp: existing.timestamp || ch.timestamp
-              });
-            } else {
-              mergedMap.set(key, ch);
-            }
-          });
-
-          accumulatedChannels = Array.from(mergedMap.values());
-        }
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `HTTP error ${response.status}`);
       }
 
-      setLastDuplicateCount(duplicatesTotal);
-      saveChannels(accumulatedChannels);
-      
-      if (Object.keys(combinedStats).length > 0) {
-        setLastSearchStats(combinedStats);
-        localStorage.setItem("last_search_stats", JSON.stringify(combinedStats));
-      }
-
-      if (duplicatesTotal > 0) {
-        addLog(`[Engine] Scrape merged. Found and merged ${duplicatesTotal} duplicate entries based on unique identifiers.`);
-      }
-
-      // Add to history
-      const newHistoryItem: SearchQueryHistory = {
-        query: query.trim(),
-        source,
-        mode,
-        timestamp: new Date().toISOString(),
-      };
-      const updatedHistory = [newHistoryItem, ...history.filter(h => h.query !== query.trim())].slice(0, 10);
-      saveHistory(updatedHistory);
-
+      const data = await response.json();
+      setActiveSearchId(String(data.searchId));
+      setActiveSearchStatus({ status: data.status, progress: 0, currentSource: null });
+      await loadSearches();
     } catch (err: any) {
-      addLog(`Error performing search: ${err.message}`);
-      if (err.message.includes("GEMINI_API_KEY")) {
+      setIsSearching(false);
+      addLog(`[Error] Failed to start search: ${err.message}`);
+      if (err.message && err.message.includes("GEMINI_API_KEY")) {
         setApiKeyMissing(true);
       }
-    } finally {
-      setIsSearching(false);
     }
   };
 
@@ -301,7 +215,7 @@ export default function App() {
       const response = await fetch("/api/extract-link", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ detailUrl: channel.detailUrl, mode }),
+        body: JSON.stringify({ resultId: Number(channelId) }),
       });
 
       if (!response.ok) {
@@ -316,19 +230,9 @@ export default function App() {
         data.logs.forEach((backendLog: string) => addLog(`[Backend] ${backendLog}`));
       }
 
-      if (data.success && data.telegramUrl) {
-        addLog(`[Extraction] Success! Found Telegram link for "${channel.title}": ${data.telegramUrl}`);
-        updateChannels((prev) => prev.map((c) =>
-          c.id === channelId ? {
-            ...c,
-            telegramUrl: data.telegramUrl,
-            username: data.username,
-            channelDescription: data.channelDescription,
-            stats: data.stats,
-            similarChannels: data.similarChannels || null,
-            extractionStatus: "success" as const
-          } : c
-        ));
+      if (data.success && data.result) {
+        addLog(`[Extraction] Success! Found Telegram link for "${channel.title}": ${data.result.telegramUrl}`);
+        updateChannels((prev) => prev.map((c) => c.id === channelId ? data.result : c));
       } else {
         addLog(`[Extraction] Warning: No Telegram link found on catalog page for "${channel.title}".`);
         updateChannels((prev) => prev.map((c) =>
@@ -351,6 +255,18 @@ export default function App() {
     }
   };
 
+  const enrichImported = async () => {
+    addLog("[Import] Запуск массового обогащения импортированных ссылок.");
+    try {
+      const res = await fetch("/api/import/enrich", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      await loadSearch(activeSearchId || "");
+      setImportSummary(`Обогащение: обработано ${data.total} · обновлено ${data.updated} · ошибок ${data.failed}`);
+      addLog(`[Import] Обогащение: обновлено ${data.updated}, ошибок ${data.failed}.`);
+    } catch (error: any) { addLog(`[Import] Ошибка обогащения: ${error.message}`); }
+  };
+
   // Bulk Extraction Engine / Queue Loop
   useEffect(() => {
     if (!isExtractingBulk || bulkQueue.length === 0 || currentBulkIndex >= bulkQueue.length) {
@@ -364,7 +280,7 @@ export default function App() {
     const nextId = bulkQueue[currentBulkIndex];
     const channel = channelsRef.current.find(c => c.id === nextId);
 
-    if (!channel || channel.extractionStatus === "success") {
+    if (!channel || channel.extractionStatus === "success" || channel.extractionStatus === "guessed") {
       // Skip if already success
       setCurrentBulkIndex(prev => prev + 1);
       return;
@@ -386,8 +302,9 @@ export default function App() {
 
   // Start Bulk Extraction for all filtered/pending channels
   const startBulkExtraction = () => {
-    const pendingIds = filteredChannels
-      .filter(c => c.extractionStatus !== "success")
+    const selectedSearchChannels = activeSearchId ? filteredChannels.filter((channel) => channel.searchId === activeSearchId) : filteredChannels;
+    const pendingIds = selectedSearchChannels
+      .filter(c => c.extractionStatus === "pending" || c.extractionStatus === "failed")
       .map(c => c.id);
 
     if (pendingIds.length === 0) {
@@ -509,6 +426,41 @@ export default function App() {
     addLog(`[Export] Successfully compiled and downloaded JSON dataset for ${filteredChannels.length} channels.`);
   };
 
+  const downloadFile = (content: string, filename: string, type: string) => {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportLinksToTXT = () => {
+    const exportChannels = activeSearchId ? filteredChannels.filter((channel) => channel.searchId === activeSearchId) : filteredChannels;
+    const links = Array.from(new Set(exportChannels.map((channel) => channel.telegramUrl).filter((url): url is string => Boolean(url))));
+    if (links.length === 0) return addLog("[Export] No direct Telegram links are available for TXT export.");
+    downloadFile(links.join("\n") + "\n", `telegram_links_${new Date().toISOString().split("T")[0]}.txt`, "text/plain;charset=utf-8");
+    addLog(`[Export] Downloaded ${links.length} unique direct links as TXT.`);
+  };
+
+  const exportReportToTXT = () => {
+    const exportChannels = activeSearchId ? filteredChannels.filter((channel) => channel.searchId === activeSearchId) : filteredChannels;
+    if (exportChannels.length === 0) return;
+    const report = exportChannels.map((channel) => [
+      `Название: ${channel.title}`,
+      `Описание: ${channel.channelDescription || channel.description || "—"}`,
+      `Тип: ${channel.chatType || "unknown"}`,
+      `Источник: ${channel.source}`,
+      `Каталог: ${channel.detailUrl}`,
+      `Telegram: ${channel.telegramUrl || "не найдено"}`,
+    ].join("\n")).join("\n\n");
+    downloadFile(report + "\n", `telegram_report_${new Date().toISOString().split("T")[0]}.txt`, "text/plain;charset=utf-8");
+    addLog(`[Export] Downloaded extended TXT report for ${exportChannels.length} records.`);
+  };
+
   // Copy all extracted links to clipboard
   const copyAllLinks = () => {
     const links = filteredChannels
@@ -533,25 +485,65 @@ export default function App() {
     setTimeout(() => setCopiedChannelId(null), 1500);
   };
 
-  // Clear current scraped channels list
-  const clearDatabase = () => {
+  const clearDatabase = async () => {
+    if (!activeSearchId) return;
     if (!isConfirmingClear) {
       setIsConfirmingClear(true);
-      addLog(`[Database] Click "Clear Database" again to confirm deletion.`);
+      addLog("[Database] Click Clear Search again to confirm deletion.");
       return;
     }
-    saveChannels([]);
+    const response = await fetch(`/api/searches/${activeSearchId}`, { method: "DELETE" });
+    if (!response.ok) return addLog("[Database] The selected saved search could not be deleted.");
+    setChannels([]);
+    setLogs([]);
+    setActiveSearchId(null);
     setLastSearchStats(null);
-    addLog(`[Database] Cleared all scraped channel records and stats from memory.`);
     setIsConfirmingClear(false);
+    await loadSearches();
+    addLog("[Database] Deleted the selected saved search and its records.");
   };
 
-  // Click on a past history item to re-search
-  const applyHistoryQuery = (h: SearchQueryHistory) => {
-    setQuery(h.query);
-    setSource(h.source);
-    setMode(h.mode);
+  const deleteChannel = async (channel: ScrapedChannel) => {
+    const response = await fetch(`/api/results/${channel.id}`, { method: "DELETE" });
+    if (!response.ok) return addLog(`[Database] Could not delete "${channel.title}".`);
+    setChannels((current) => current.filter((item) => item.id !== channel.id));
+    addLog(`[Database] Deleted channel "${channel.title}" from this search.`);
+    await loadSearches();
   };
+
+  const deleteSearchFromHistory = async (searchId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm("Удалить этот поиск и все его результаты?")) return;
+    const res = await fetch(`/api/searches/${searchId}`, { method: "DELETE" });
+    if (!res.ok) { addLog(`[History] Не удалось удалить поиск: HTTP ${res.status}`); return; }
+    if (activeSearchId === searchId) { setActiveSearchId(null); setChannels([]); setLogs([]); setLastSearchStats(null); }
+    await loadSearches();
+    addLog(`[History] Поиск ${searchId} удален.`);
+  };
+
+  // Click on a past history item to load its persisted results
+  const applyHistoryQuery = async (h: SearchQueryHistory) => {
+    try {
+      await loadSearch(h.id);
+    } catch (error: any) {
+      addLog(`[History] ${error.message}`);
+    }
+  };
+
+  const logout = async () => {
+    await fetch("/api/auth/logout", { method: "POST" });
+    setCurrentUser(null);
+    setChannels([]);
+    setHistory([]);
+    setActiveSearchId(null);
+  };
+
+  const handlePasswordChanged = () => {
+    setCurrentUser((user) => user ? { ...user, mustChangePassword: false } : user);
+  };
+
+  if (isAuthLoading) return <div className="min-h-screen bg-[#0A0B0E]" />;
+  if (!currentUser) return <AuthScreen needsBootstrap={needsBootstrap} onAuthenticated={setCurrentUser} />;
 
   return (
     <div className="flex flex-col lg:flex-row h-screen w-full bg-[#0A0B0E] font-sans text-slate-300 overflow-hidden text-sm">
@@ -639,12 +631,12 @@ export default function App() {
               {isConfirmingClear ? (
                 <>
                   <AlertCircle className="w-3.5 h-3.5" />
-                  Confirm Clear?
+                  Confirm Clear Search?
                 </>
               ) : (
                 <>
                   <Trash2 className="w-3.5 h-3.5" />
-                  Clear Database
+                  Clear Search
                 </>
               )}
             </button>
@@ -656,7 +648,9 @@ export default function App() {
             <div className="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_8px_#22c55e]"></div>
             <span className="text-xs font-mono text-slate-300 font-semibold">Parser: Active</span>
           </div>
-          <div className="text-[10px] text-slate-500 font-mono">v1.2.4-stable</div>
+          <div className="text-[10px] text-slate-500 font-mono truncate">{currentUser.email}</div>
+          {currentUser.role === "owner" && <button onClick={() => setIsOwnerPanelOpen(true)} className="mt-2 text-[10px] text-blue-400 hover:text-blue-300 font-mono flex items-center gap-1"><ShieldCheck className="w-3 h-3" /> Manage users</button>}
+          <button onClick={logout} className="mt-2 text-[10px] text-slate-500 hover:text-rose-400 font-mono flex items-center gap-1"><LogOut className="w-3 h-3" /> Sign out</button>
         </div>
       </aside>
 
@@ -665,6 +659,28 @@ export default function App() {
         <Header apiKeyMissing={apiKeyMissing} />
 
         <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6">
+          <ChangePasswordPanel required={currentUser.mustChangePassword} onChanged={handlePasswordChanged} />
+          {activeSearchStatus && ["queued", "running", "cancelling"].includes(activeSearchStatus.status) && (
+            <section className="bg-[#15181E] border border-blue-500/30 rounded-lg p-4 space-y-2">
+              <div className="flex items-center justify-between text-xs text-blue-300 font-mono">
+                <span>Search {activeSearchStatus.status} {activeSearchStatus.currentSource ? `· ${activeSearchStatus.currentSource}` : ""}</span>
+                <span>{activeSearchStatus.progress || 0}%</span>
+              </div>
+              <div className="h-1.5 rounded bg-slate-800 overflow-hidden"><div className="h-full bg-blue-500 transition-all" style={{ width: `${activeSearchStatus.progress || 3}%` }} /></div>
+              <button onClick={() => activeSearchId && fetch(`/api/searches/${activeSearchId}/cancel`, { method: "POST" })} className="text-[10px] text-rose-400 hover:text-rose-300">Cancel search</button>
+            </section>
+          )}
+          {isOwnerPanelOpen && currentUser.role === "owner" && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={() => setIsOwnerPanelOpen(false)}>
+              <div className="max-h-[85vh] w-full max-w-2xl overflow-auto rounded-lg bg-[#0F1117] p-4" onClick={e=>e.stopPropagation()}>
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-semibold text-white">Manage users</span>
+                  <button onClick={() => setIsOwnerPanelOpen(false)} className="text-slate-400 hover:text-white">✕</button>
+                </div>
+                <OwnerPanel isOpen={true} />
+              </div>
+            </div>
+          )}
           {/* Layout Grid */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             
@@ -691,16 +707,17 @@ export default function App() {
                       />
                       <Search className="absolute left-3 top-3 text-slate-500 w-3.5 h-3.5" />
                     </div>
-                    <div className="mt-2.5 flex items-center justify-end">
-                      <span className="text-[9px] font-mono text-slate-500 leading-none">Multi-query (split by comma)</span>
+                    <div className="mt-2.5 flex items-center justify-between">
+                      <span className="text-[10px] font-mono text-slate-500 leading-none">Multi-query (разделяйте через запятую)</span>
+                      <SearchTips onSelectQuery={(template) => setQuery(template)} />
                     </div>
                   </div>
 
                   {/* Target Catalog Select */}
                   <div>
                     <span className="text-xs text-slate-500 block mb-1.5 uppercase font-semibold font-mono tracking-wider">Target Catalog</span>
-                    <div className="grid grid-cols-3 gap-1.5">
-                      {(["all", "tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem"] as const).map((src) => (
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+                      {(["all", "tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem", "tgcat", "catalogTelegram", "tglib", "telegram"] as const).map((src) => (
                         <button
                           key={src}
                           type="button"
@@ -792,6 +809,38 @@ export default function App() {
                 </form>
               </div>
 
+              {/* Import list */}
+              <div className="bg-[#15181E] border border-slate-800 rounded-lg p-5">
+                <h3 className="text-white font-semibold mb-3 flex items-center gap-2 text-sm uppercase tracking-wider font-sans">Импорт списка</h3>
+                <textarea id="import-links" placeholder="Вставьте t.me ссылки — по одной на строку" className="w-full h-24 bg-[#0A0B0E] border border-slate-700 rounded p-2 text-xs text-slate-300" />
+                <button onClick={async()=>{
+                  setImportSummary(null);
+                  setIsImporting(true);
+                  setImportProgress(8);
+                  const el=document.getElementById("import-links") as HTMLTextAreaElement;
+                  const raw=el?.value||"";
+                  if(!raw.trim()) { setIsImporting(false); return; }
+                  try {
+                    setImportProgress(25);
+                    const r=await fetch("/api/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({links: raw})});
+                    const d=await r.json();
+                    if(!r.ok){ addLog(`[Import] ${d.error}`); setImportSummary(`Ошибка: ${d.error}`); return; }
+                    setImportProgress(80);
+                    el.value="";
+                    if (d.id) { await loadSearch(d.id); await loadSearches(); }
+                    setImportProgress(100);
+                    const summary=`Получено: ${d.inputCount} · Уникальных: ${d.uniqueCount} · Дубликатов в файле: ${d.duplicateCount} · Уже в базе: ${d.alreadyStored || 0} · Новых: ${d.added || 0} · Preview: ${d.enriched}`;
+                    setImportSummary(summary);
+                    addLog(`[Import] ${summary}`);
+                  } catch (error:any) {
+                    setImportSummary(`Ошибка импорта: ${error.message}`);
+                  } finally { setIsImporting(false); }
+                }} disabled={isImporting} className="mt-2 w-full bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white text-xs py-2 rounded">{isImporting ? `Загрузка ${importProgress}%...` : "Загрузить в базу"}</button>
+                {isImporting && <div className="mt-2 h-1.5 rounded bg-slate-800 overflow-hidden"><div className="h-full bg-blue-500 transition-all" style={{width:`${importProgress}%`}} /></div>}
+                {importSummary && <p className="mt-2 text-xs text-blue-300 break-words">{importSummary}</p>}
+                <button onClick={enrichImported} className="mt-2 w-full border border-slate-700 hover:border-blue-500 text-slate-300 text-xs py-2 rounded">Проверить тип, описание и аватар импортированных</button>
+              </div>
+
               {/* Niche Search History (Styled to look like the Target JSON Schema box) */}
               <div className="bg-[#15181E] border border-slate-800 rounded-lg p-5 flex flex-col">
                 <h3 className="text-white font-semibold mb-3 flex items-center gap-2 text-sm uppercase tracking-wider font-sans">
@@ -805,13 +854,16 @@ export default function App() {
                     </div>
                   ) : (
                     history.map((h, idx) => (
-                      <div 
-                        key={idx}
+                      <div
+                        key={h.id}
                         onClick={() => applyHistoryQuery(h)}
                         className="cursor-pointer hover:bg-slate-800/60 p-1.5 rounded transition-colors flex items-center justify-between text-[11px] text-slate-300 border border-slate-900 hover:border-slate-800"
                       >
-                        <span className="truncate max-w-[130px] font-semibold text-blue-400">"{h.query}"</span>
-                        <span className="text-[10px] text-slate-500 font-mono bg-[#15181E] px-1 rounded uppercase">{h.source}</span>
+                        <span className="truncate max-w-[110px] font-semibold text-blue-400">"{h.query}"</span>
+                        <span className="flex items-center gap-1">
+                          <span className="text-[10px] text-slate-500 font-mono bg-[#15181E] px-1 rounded uppercase">{h.source} · {h.status} · {h.resultCount}</span>
+                          <button onClick={(e) => deleteSearchFromHistory(h.id, e)} className="p-0.5 hover:bg-rose-900/30 rounded text-slate-500 hover:text-rose-400" title="Удалить поиск"><Trash2 className="w-3 h-3" /></button>
+                        </span>
                       </div>
                     ))
                   )}
@@ -909,6 +961,20 @@ export default function App() {
                         <FileJson className="w-3.5 h-3.5" />
                       </button>
                       <button
+                        onClick={exportLinksToTXT}
+                        title="Export direct links as TXT"
+                        className="p-1.5 hover:bg-slate-800 border border-slate-700 rounded text-slate-300 bg-[#0A0B0E] transition-all cursor-pointer"
+                      >
+                        <FileText className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={exportReportToTXT}
+                        title="Export extended TXT report"
+                        className="p-1.5 hover:bg-slate-800 border border-slate-700 rounded text-slate-300 bg-[#0A0B0E] transition-all cursor-pointer"
+                      >
+                        <BookOpen className="w-3.5 h-3.5" />
+                      </button>
+                      <button
                         onClick={copyAllLinks}
                         title="Copy direct links"
                         className="px-2.5 py-1.5 hover:bg-slate-800 border border-slate-700 rounded text-slate-300 hover:text-white bg-[#0A0B0E] transition-all flex items-center gap-1 cursor-pointer font-bold text-[10px] uppercase font-mono"
@@ -948,7 +1014,6 @@ export default function App() {
                       <button 
                         onClick={() => {
                           setLastSearchStats(null);
-                          localStorage.removeItem("last_search_stats");
                         }}
                         className="text-[10px] text-slate-500 hover:text-slate-300 font-mono"
                       >
@@ -957,7 +1022,7 @@ export default function App() {
                     </div>
                     
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-                      {(["tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem"] as const).map((src) => {
+                      {Object.keys(lastSearchStats).map((src) => {
                         const stats = lastSearchStats[src];
                         const isSearched = !!stats;
                         return (
@@ -1026,7 +1091,7 @@ export default function App() {
                   <div className="flex flex-wrap gap-2 items-center">
                     {/* Source Filters */}
                     <div className="flex bg-[#0A0B0E] border border-slate-800 p-0.5 rounded text-[10px] font-mono">
-                      {(["all", "tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem"] as const).map((sf) => (
+                      {(["all", "tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem", "tgcat", "catalogTelegram", "tglib", "telegram"] as const).map((sf) => (
                         <button
                           key={sf}
                           onClick={() => setSourceFilter(sf)}
@@ -1140,8 +1205,8 @@ export default function App() {
                                       {(channel.chatType || "unknown") === "closed" ? "Private" : (channel.chatType || "unknown") === "group" ? "Group" : (channel.chatType || "unknown") === "channel" ? "Channel" : "Unknown"}
                                     </span>
                                   </div>
-                                  <p className="text-slate-400 text-[11px] line-clamp-1 font-normal">
-                                    {channel.channelDescription || channel.description}
+                                  <p className="text-slate-400 text-[11px] font-normal break-words" title={channel.channelDescription || channel.description}>
+                                    {(channel.channelDescription || channel.description || "").slice(0,180)}
                                   </p>
                                 </div>
                               </div>
@@ -1246,10 +1311,7 @@ export default function App() {
                                 </button>
 
                                 <button
-                                  onClick={() => {
-                                    saveChannels(channels.filter(c => c.id !== channel.id));
-                                    addLog(`[Database] Deleted channel "${channel.title}" from dataset.`);
-                                  }}
+                                  onClick={() => deleteChannel(channel)}
                                   className="p-1 hover:bg-rose-950/20 border border-transparent hover:border-rose-900 rounded text-slate-500 hover:text-rose-400 transition-colors"
                                   title="Delete record"
                                 >

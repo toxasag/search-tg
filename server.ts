@@ -1,10 +1,47 @@
 import express from "express";
+import cookieParser from "cookie-parser";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import * as cheerio from "cheerio";
 import dotenv from "dotenv";
 import { setGlobalDispatcher, ProxyAgent } from "undici";
+import { db, recoverStaleSearches, isDatabaseEmpty } from "./server/db.js";
+import { normalizeTelegramLink } from "./src/telegram-links.js";
+import { EXTRA_CATALOGS, fetchCatalogPage } from "./server/catalog-sources.js";
+import { telegramConfigured, searchTelegram } from "./server/telegram-discovery.js";
+import { searchContext } from "./server/search-context.js";
+export { db };
+import {
+  attachSession,
+  bootstrapOwner,
+  changePassword,
+  createManagedUser,
+  createSession,
+  destroySession,
+  login,
+  requireOwner,
+  requireUser,
+  type AuthenticatedRequest,
+} from "./server/auth.js";
+import {
+  completeSearch,
+  createSearch,
+  getSearchStatus,
+  claimSearch,
+  touchSearch,
+  requestSearchCancel,
+  isSearchCancelRequested,
+  listQueuedSearches,
+  deleteResult,
+  deleteSearch,
+  getResult,
+  getSearch,
+  listSearches,
+  saveResults,
+  updateResult,
+  searchCachedChannels,
+} from "./server/store.js";
 
 dotenv.config();
 
@@ -18,10 +55,18 @@ if (proxyUrl) {
   console.log(`[Network] Routing outbound requests through proxy: ${proxyUrl}`);
 }
 
-const app = express();
+export const app = express();
 const PORT = 3000;
+const MAX_PAGES = 500;
+const MAX_GLOBAL_CONCURRENT_SEARCHES = 2;
+const activeSearches = new Set<number>();
+let activeGlobalJobCount = 0;
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+app.use(cookieParser());
+app.use(attachSession);
+
+recoverStaleSearches();
 
 // Lazy-initialize Gemini client
 let aiClient: GoogleGenAI | null = null;
@@ -642,7 +687,7 @@ function parseWithSelectors(html: string, source: string, baseUrl: string): any[
 const CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // Helper to make a fetch request with randomized mobile/desktop browser headers and automatic retry
-async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000, extraHeaders: Record<string, string> = {}): Promise<string> {
+async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000, extraHeaders: Record<string, string> = {}, timeoutMs = 15000): Promise<string> {
   const headers = {
     "User-Agent": CHROME_USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -717,6 +762,186 @@ async function fetchSessionCookie(baseUrl: string, logs?: string[]): Promise<str
 
 // ---------------- API ENDPOINTS ----------------
 
+function safeSearchInput(body: any): { query: string; source: string; mode: "fast" | "ai"; limitPages: number } {
+  const query = typeof body.query === "string" ? body.query.trim() : "";
+  const source = typeof body.source === "string" ? body.source : "all";
+  const mode = body.mode === "ai" ? "ai" : "fast";
+  const requestedLimit = Number.parseInt(String(body.limitPages), 10);
+  const limitPages = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), MAX_PAGES) : MAX_PAGES;
+  const validSources = [
+    "all",
+    "tgsearch",
+    "tgramcat",
+    "tgramsearch",
+    "waybien",
+    "lyzem",
+    ...EXTRA_CATALOGS,
+    "telegram",
+  ];
+  if (!query) throw new Error("Search query is required.");
+  if (!validSources.includes(source)) throw new Error("Unsupported search source.");
+  return { query, source, mode, limitPages };
+}
+
+app.get("/api/auth/me", (req: AuthenticatedRequest, res) => {
+  res.json({ user: req.user || null, needsBootstrap: !req.user && isDatabaseEmpty() });
+});
+
+app.post("/api/auth/bootstrap", async (req, res) => {
+  if (!isDatabaseEmpty()) {
+    return res.status(400).json({ error: "Owner account is already configured." });
+  }
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
+  try {
+    const user = await createManagedUser(email, password) as any;
+    db.prepare("UPDATE users SET role = 'owner', must_change_password = 0 WHERE id = ?").run(user.id);
+    const ownerUser = { id: user.id, email: user.email, role: "owner" as const, mustChangePassword: false };
+    await createSession(res, ownerUser);
+    res.json({ user: ownerUser });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/api/channels/search", requireUser, (req: AuthenticatedRequest, res) => {
+  const q = typeof req.query?.q === "string" ? req.query.q : "";
+  const results = searchCachedChannels(q, 100);
+  res.json({ results });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const user = await login(req.body?.email, req.body?.password);
+  if (!user) return res.status(401).json({ error: "Invalid email or password." });
+  await createSession(res, user);
+  res.json({ user });
+});
+
+app.post("/api/auth/logout", (req: AuthenticatedRequest, res) => {
+  destroySession(req, res);
+  res.status(204).end();
+});
+
+app.post("/api/auth/change-password", requireUser, async (req: AuthenticatedRequest, res) => {
+  try {
+    await changePassword(req.user!.id, req.body?.currentPassword, req.body?.newPassword);
+    res.status(204).end();
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/import", requireUser, async (req: AuthenticatedRequest, res) => {
+  const raw = typeof req.body?.links === "string" ? req.body.links : "";
+  const input = raw.split(/[\s,;\n]+/).filter(Boolean).slice(0, 5000);
+  const valid = input.map(value => normalizeTelegramLink(value)).filter((value): value is string => typeof value === "string");
+  const unique: string[] = Array.from(new Set(valid));
+  if (!unique.length) return res.status(400).json({ error: "Не найдено валидных Telegram-ссылок." });
+  const userId = req.user!.id;
+  const { getCachedChannel } = await import("./server/db.js");
+  const imported: any[] = [];
+  let fromBase = 0;
+  let enriched = 0;
+  let alreadyStored = 0;
+  for (const url of unique) {
+    const key = `telegram:${url}`;
+    const cached = getCachedChannel(key);
+    if (cached) { fromBase++; alreadyStored++; continue; }
+    const item: any = { title: url.replace("https://t.me/", "@"), description: "", detailUrl: url, source: "import", telegramUrl: url, username: url.split("/").pop() || null, extractionStatus: "pending", chatType: url.includes("+") ? "closed" : "unknown" };
+    try {
+      const preview = await enrichTelegramPreview(url);
+      Object.assign(item, preview);
+      item.telegramUrl = normalizeTelegramLink(url) || url;
+      item.username = item.telegramUrl.startsWith("https://t.me/") && !item.telegramUrl.includes("+") ? item.telegramUrl.split("/").pop() : null;
+      item.extractionStatus = preview.chatType === "unknown" ? "pending" : "success";
+      enriched++;
+    } catch (error: any) { item.error = error.message; }
+    imported.push(item);
+  }
+  if (!imported.length) return res.json({ id: null, inputCount: input.length, uniqueCount: unique.length, duplicateCount: input.length - unique.length, alreadyStored, fromBase, enriched, results: [] });
+  const searchId = createSearch(userId, { query: `Импорт ${imported.length} новых ссылок`, source: "import", mode: "fast", limitPages: 1, requestId: `import-${Date.now()}-${Math.random()}` });
+  saveResults(searchId, imported);
+  completeSearch(searchId, userId, { import: { pagesFetched: 1, totalFound: input.length, uniqueAdded: imported.length, duplicatesFiltered: input.length - unique.length + alreadyStored, fromBase, enriched } }, [`[Import] Получено строк: ${input.length}`, `[Import] Уникальных в файле: ${unique.length}`, `[Import] Дубликатов в файле: ${input.length - unique.length}`, `[Import] Уже в постоянной базе: ${alreadyStored}`, `[Import] Новых добавлено: ${imported.length}`, `[Import] Обогащено из Telegram preview: ${enriched}`]);
+  res.json({ id: String(searchId), inputCount: input.length, uniqueCount: unique.length, duplicateCount: input.length - unique.length, alreadyStored, fromBase, enriched, added: imported.length, results: imported });
+});
+
+app.post("/api/import/enrich", requireUser, async (req: AuthenticatedRequest, res) => {
+  const userId = req.user!.id;
+  const rows = db.prepare(`SELECT r.id, r.telegram_url FROM search_results r JOIN searches s ON s.id=r.search_id WHERE s.user_id=? AND r.source='import' AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown') LIMIT 2000`).all(userId) as {id:number; telegram_url:string}[];
+  let updated = 0;
+  let failed = 0;
+  for (const row of rows) {
+    try {
+      const url = normalizeTelegramLink(row.telegram_url);
+      if (!url) continue;
+      const preview = await enrichTelegramPreview(url);
+      const existing = getResult(userId, row.id);
+      if (!existing) continue;
+      updateResult(userId, row.id, { title: preview.title, description: preview.description, imageUrl: preview.imageUrl, subscribers: preview.subscribers, chatType: preview.chatType, telegramUrl: url, username: url.includes('/+') ? null : url.split('/').pop() || null, extractionStatus: preview.chatType === 'unknown' ? 'pending' : 'success' });
+      updated++;
+    } catch { failed++; }
+  }
+  res.json({ total: rows.length, updated, failed });
+});
+
+app.get("/api/admin/searches", requireOwner, (_req, res) => {
+  const rows = db.prepare("SELECT s.id, s.query, s.source, s.status, s.created_at, u.email, (SELECT COUNT(*) FROM search_results r WHERE r.search_id=s.id) AS result_count FROM searches s JOIN users u ON u.id=s.user_id ORDER BY s.created_at DESC LIMIT 100").all();
+  res.json({ searches: rows });
+});
+app.get("/api/admin/users", requireOwner, (_req, res) => {
+  const users = db.prepare("SELECT id, email, role, is_active, must_change_password, created_at FROM users ORDER BY created_at DESC").all();
+  res.json({ users });
+});
+
+app.post("/api/admin/users", requireOwner, async (req, res) => {
+  try {
+    const user = await createManagedUser(req.body?.email, req.body?.temporaryPassword);
+    res.status(201).json({ user });
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/admin/users/:id", requireOwner, (req: AuthenticatedRequest, res) => {
+  const userId = Number(req.params.id);
+  const isActive = Boolean(req.body?.isActive);
+  if (!Number.isInteger(userId) || userId === req.user!.id) return res.status(400).json({ error: "The owner account cannot be changed here." });
+  const changed = db.prepare("UPDATE users SET is_active = ? WHERE id = ? AND role = 'user'").run(isActive ? 1 : 0, userId).changes;
+  if (!changed) return res.status(404).json({ error: "User was not found." });
+  if (!isActive) db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
+  res.status(204).end();
+});
+
+app.delete("/api/admin/users/:id", requireOwner, (req: AuthenticatedRequest, res) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId === req.user!.id) return res.status(400).json({ error: "The owner account cannot be deleted." });
+  const changed = db.prepare("DELETE FROM users WHERE id = ? AND role = 'user'").run(userId).changes;
+  if (!changed) return res.status(404).json({ error: "User was not found." });
+  res.status(204).end();
+});
+
+app.get("/api/searches", requireUser, (req: AuthenticatedRequest, res) => {
+  res.json({ searches: listSearches(req.user!.id) });
+});
+
+app.get("/api/searches/:id", requireUser, (req: AuthenticatedRequest, res) => {
+  const search = getSearch(req.user!.id, Number(req.params.id));
+  if (!search) return res.status(404).json({ error: "Search was not found." });
+  res.json(search);
+});
+
+app.delete("/api/searches/:id", requireUser, (req: AuthenticatedRequest, res) => {
+  if (!deleteSearch(req.user!.id, Number(req.params.id))) return res.status(404).json({ error: "Search was not found." });
+  res.status(204).end();
+});
+
+app.delete("/api/results/:id", requireUser, (req: AuthenticatedRequest, res) => {
+  if (!deleteResult(req.user!.id, Number(req.params.id))) return res.status(404).json({ error: "Result was not found." });
+  res.status(204).end();
+});
+
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date() });
 });
@@ -740,7 +965,20 @@ function getSearchUrlForSource(source: string, query: string, page: number): str
   }
 }
 
-// Get the base URL for a given source
+async function enrichTelegramPreview(url: string) {
+  const response = await fetch(url, { headers: { "User-Agent": CHROME_USER_AGENT }, signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error(`Telegram preview HTTP ${response.status}`);
+  const $ = cheerio.load(await response.text());
+  const title = $("meta[property='og:title']").attr("content") || $(".tgme_page_title").text().trim();
+  const description = $("meta[property='og:description']").attr("content") || $(".tgme_page_description").text().trim();
+  const imageUrl = $("meta[property='og:image']").attr("content") || $(".tgme_page_photo_image img").attr("src") || null;
+  const extra = $(".tgme_page_extra").text().trim();
+  const subscribers = extra.match(/[\d.,KMB]+\s+(?:subscribers|members)/i)?.[0] || null;
+  const lower = `${extra} ${$(".tgme_page_action").text()}`.toLowerCase();
+  const chatType = /members|join group|chat/.test(lower) ? "group" : /subscribers|view channel/.test(lower) ? "channel" : url.includes("+") || url.includes("joinchat") ? "closed" : "unknown";
+  return { title: title || url.replace("https://t.me/", "@"), description: description || "", imageUrl, subscribers, chatType };
+}
+
 function getBaseUrlForSource(source: string): string {
   switch (source) {
     case "tgsearch":
@@ -758,396 +996,503 @@ function getBaseUrlForSource(source: string): string {
   }
 }
 
-// Endpoint to Search Catalogs
-app.post("/api/search", async (req: express.Request, res: express.Response) => {
-  const { query, source = "all", mode = "fast", limitPages } = req.body;
+export async function runSearchJob(userId: number, searchId: number, input: { query: string; source: string; mode: "fast" | "ai"; limitPages: number }) {
+  const { query, source, mode, limitPages } = input;
+  if (activeSearches.has(userId)) throw new Error("A search is already running for this account.");
+  activeSearches.add(userId);
 
-  if (!query) {
-    res.status(400).json({ error: "Search query is required." });
-    return;
+  const existingSearch = getSearch(userId, searchId);
+  const searchStats: Record<string, any> = existingSearch?.searchStats || {};
+  const logs: string[] = existingSearch?.logs || [];
+
+  function addLog(msg: string) {
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] ${msg}`;
+    logs.push(line);
+    return line;
   }
+
+  const rawQueries = query.split(/[,;\n]+/).map(q => q.trim()).filter(Boolean);
+  const subQueries = rawQueries.length > 0 ? rawQueries : [query.trim()];
 
   const sources: string[] = [];
   if (source === "all") {
-    sources.push("tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem");
+    sources.push("tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem", ...EXTRA_CATALOGS);
+    if (telegramConfigured()) sources.push("telegram");
   } else {
     sources.push(source);
   }
 
-  const results: any[] = [];
-  const logs: string[] = [];
-  const searchStats: Record<string, { pagesFetched: number; totalFound: number; tgLinksFound?: number; rawCardsFound?: number; duplicatesFiltered: number; uniqueAdded: number }> = {};
+  addLog(`Starting automated deep search across sources: [${sources.join(", ")}] for [${subQueries.join(", ")}]...`);
 
-  logs.push(`Starting automated deep search across sources: [${sources.join(", ")}] for "${query}"...`);
+  let searchFailed = false;
+  let hasAnySuccess = false;
 
   try {
-  for (const src of sources) {
-    searchStats[src] = {
-      pagesFetched: 0,
-      totalFound: 0,
-      tgLinksFound: 0,
-      duplicatesFiltered: 0,
-      uniqueAdded: 0
-    };
-    let page = 1;
-    let hasMore = true;
-    let consecutiveEmptyPages = 0;
-    const batchSize = 5; // Parallel/sequential stagger batch size to stay fast but be respectful
-    const maxPages = limitPages ? parseInt(limitPages as string, 10) : 500; // Customizable limit, default to 500
-    const seenTitlesAndUrls = new Set<string>();
+    for (let qIdx = 0; qIdx < subQueries.length; qIdx++) {
+      const q = subQueries[qIdx];
 
-    // tgramsearch gates real content behind a session cookie issued on the homepage —
-    // a stateless request to a deep search URL can silently come back with an empty page.
-    let sessionCookie = "";
-    if (src === "tgramsearch") {
-      sessionCookie = await fetchSessionCookie(getBaseUrlForSource(src), logs);
-      logs.push(sessionCookie
-        ? `[Session] tgramsearch: session cookie acquired from homepage warmup.`
-        : `[Session] tgramsearch: homepage warmup returned no cookie — proceeding without one.`);
-    }
-    const srcExtraHeaders: Record<string, string> = src === "tgramsearch"
-      ? { Referer: `${getBaseUrlForSource(src)}/`, ...(sessionCookie ? { Cookie: sessionCookie } : {}) }
-      : {};
+      for (let sIdx = 0; sIdx < sources.length; sIdx++) {
+        const src = sources[sIdx];
+        if (isSearchCancelRequested(searchId)) {
+          addLog(`[Search] Cancel requested before source ${src}.`);
+          completeSearch(searchId, userId, searchStats, logs, "cancelled");
+          return;
+        }
 
-    logs.push(`[Pagination Engine] Commencing automated paging for ${src} (limit: ${maxPages} pages)`);
+        if (searchStats[src]?.status === "completed") {
+          addLog(`[Recovery] Skipping ${src} (already completed previously).`);
+          hasAnySuccess = true;
+          continue;
+        }
 
-    while (hasMore && page <= maxPages) {
-      const batchPages: number[] = [];
-      for (let i = 0; i < batchSize && (page + i) <= maxPages; i++) {
-        batchPages.push(page + i);
-      }
+        if (searchStats[src]?._completedQueries?.includes(q)) {
+          addLog(`[Recovery] Skipping ${src} for "${q}" (already completed previously).`);
+          hasAnySuccess = true;
+          continue;
+        }
 
-      logs.push(`[Scanning] ${src} — pages ${batchPages[0]}–${batchPages[batchPages.length - 1]} of ~${maxPages}...`);
+        if (!searchStats[src]) {
+          searchStats[src] = {
+            pagesFetched: 0,
+            totalFound: 0,
+            tgLinksFound: 0,
+            duplicatesFiltered: 0,
+            uniqueAdded: 0,
+            status: "running",
+          };
+        }
 
-      try {
-        const batchResults: any[] = [];
-        // Stagger requests within the batch sequentially with a tiny sleep to be extremely friendly and bypass rate-limiters
-        for (let idx = 0; idx < batchPages.length; idx++) {
-          const p = batchPages[idx];
-          if (idx > 0) {
-            await new Promise((resolve) => setTimeout(resolve, 250)); // 250ms stagger delay
+        let page = 1;
+        let hasMore = true;
+        const maxPages = limitPages;
+
+        // Check if EXTRA_CATALOGS
+        if (EXTRA_CATALOGS.includes(src)) {
+          addLog(`[Pagination Engine] Commencing automated paging for ${src} (limit: ${maxPages} pages)`);
+          while (hasMore && page <= maxPages) {
+            if (isSearchCancelRequested(searchId)) {
+              addLog(`[Search] Cancel requested during ${src}.`);
+              completeSearch(searchId, userId, searchStats, logs, "cancelled");
+              return;
+            }
+            touchSearch(searchId, Math.min(99, Math.round(((sIdx + (page - 1) / Math.max(maxPages, 1)) / sources.length) * 100)), src, searchStats, logs);
+            try {
+              addLog(`[Page] [${page}] Fetching ${src} for "${q}"...`);
+              const abortController = new AbortController();
+              const result = await searchContext.run({
+                log: (m: string) => addLog(`[${src}] ${m}`),
+                checkCancelled: () => {
+                  if (isSearchCancelRequested(searchId)) throw new Error("Search was cancelled.");
+                },
+                signal: abortController.signal
+              }, () => fetchCatalogPage(src, q, page));
+
+              searchStats[src].pagesFetched++;
+              searchStats[src].totalFound += result.results.length;
+              if (result.results.length > 0) {
+                saveResults(searchId, result.results);
+                searchStats[src].uniqueAdded += result.results.length;
+                addLog(`[Page] [Saved] ${result.results.length} channels from ${src} saved to database.`);
+                hasAnySuccess = true;
+              }
+              hasMore = result.hasMore && result.results.length > 0;
+              page++;
+              touchSearch(searchId, Math.min(99, Math.round(((sIdx + page / Math.max(maxPages, 1)) / sources.length) * 100)), src, searchStats, logs);
+            } catch (err: any) {
+              if (isSearchCancelRequested(searchId)) {
+                completeSearch(searchId, userId, searchStats, logs, "cancelled");
+                return;
+              }
+              searchStats[src].status = "failed";
+              searchStats[src].error = err.message;
+              addLog(`[Error] ${src} (Page ${page}): ${err.message}`);
+              hasMore = false;
+              break;
+            }
           }
-          const searchUrl = getSearchUrlForSource(src, query, p);
-          if (!searchUrl) {
-            batchResults.push({ page: p, results: [] });
-            continue;
+          if (searchStats[src].status !== "failed") {
+            searchStats[src]._completedQueries = searchStats[src]._completedQueries || [];
+            if (!searchStats[src]._completedQueries.includes(q)) searchStats[src]._completedQueries.push(q);
+            if (subQueries.every(sq => searchStats[src]._completedQueries.includes(sq))) {
+              searchStats[src].status = "completed";
+            }
           }
+          continue;
+        }
+
+        // Check if telegram
+        if (src === "telegram") {
+          addLog(`[Telegram] Commencing MTProto discovery for "${q}"...`);
+          try {
+            searchStats[src].pagesFetched = 1;
+            const tgResults = await searchTelegram(q);
+            searchStats[src].totalFound = tgResults.length;
+            if (tgResults.length > 0) {
+              saveResults(searchId, tgResults);
+              searchStats[src].uniqueAdded += tgResults.length;
+              addLog(`[Saved] ${tgResults.length} channels from Telegram saved to database.`);
+              hasAnySuccess = true;
+            }
+            searchStats[src]._completedQueries = searchStats[src]._completedQueries || [];
+            if (!searchStats[src]._completedQueries.includes(q)) searchStats[src]._completedQueries.push(q);
+            if (subQueries.every(sq => searchStats[src]._completedQueries.includes(sq))) {
+              searchStats[src].status = "completed";
+            }
+          } catch (err: any) {
+            searchStats[src].status = "failed";
+            searchStats[src].error = err.message;
+            addLog(`[Error] Telegram discovery: ${err.message}`);
+          }
+          continue;
+        }
+
+        // Standard catalogs
+        let sourceUnavailable = false;
+        let consecutiveEmptyPages = 0;
+        const batchSize = 5;
+        const seenTitlesAndUrls = new Set<string>();
+
+        let sessionCookie = "";
+        if (src === "tgramsearch") {
+          sessionCookie = await fetchSessionCookie(getBaseUrlForSource(src), logs);
+          addLog(sessionCookie
+            ? `[Session] tgramsearch: session cookie acquired from homepage warmup.`
+            : `[Session] tgramsearch: homepage warmup returned no cookie — proceeding without one.`);
+        }
+        const srcExtraHeaders: Record<string, string> = src === "tgramsearch"
+          ? { Referer: `${getBaseUrlForSource(src)}/`, ...(sessionCookie ? { Cookie: sessionCookie } : {}) }
+          : {};
+
+        addLog(`[Pagination Engine] Commencing automated paging for ${src} (limit: ${maxPages} pages)`);
+
+        while (hasMore && page <= maxPages) {
+          if (isSearchCancelRequested(searchId)) {
+            addLog(`[Search] Cancel requested during ${src}.`);
+            completeSearch(searchId, userId, searchStats, logs, "cancelled");
+            return;
+          }
+
+          touchSearch(searchId, Math.min(99, Math.round(((sIdx + (page - 1) / Math.max(maxPages, 1)) / sources.length) * 100)), src, searchStats, logs);
+          const batchPages: number[] = [];
+          for (let i = 0; i < batchSize && (page + i) <= maxPages; i++) {
+            batchPages.push(page + i);
+          }
+
+          addLog(`[Scanning] ${src} — pages ${batchPages[0]}–${batchPages[batchPages.length - 1]} of ~${maxPages}...`);
 
           try {
-            const html = await fetchWithHeaders(searchUrl, 2, 1000, srcExtraHeaders); // 2 retries with 1000ms delay
-            const baseUrl = getBaseUrlForSource(src);
-            let parsedResults: any[] = [];
-
-            if (mode === "fast") {
-              parsedResults = parseWithSelectors(html, src, baseUrl);
-
-              if (parsedResults.length === 0 && p === 1 && process.env.GEMINI_API_KEY) {
-                logs.push(`[Fallback] Page 1 selectors empty on ${src}. Trying smart AI parser...`);
-                try {
-                  parsedResults = await parseWithAI(html, src, query);
-                } catch (aiErr: any) {
-                  console.error("Gemini API error during fallback parsing:", aiErr);
-                  logs.push(`[Fallback Warning] Gemini AI failed: ${aiErr.message || aiErr}`);
-                }
+            let newResultsInBatchCount = 0;
+            let allPagesInBatchEmpty = true;
+            for (let idx = 0; idx < batchPages.length; idx++) {
+              if (isSearchCancelRequested(searchId)) {
+                addLog(`[Search] Cancel requested.`);
+                return;
               }
-            } else {
+              const p = batchPages[idx];
+              addLog(`[Page] [${p}] Scanning ${src}...`);
+              touchSearch(searchId, Math.min(99, Math.round(((sIdx + (p - 1) / Math.max(maxPages, 1)) / sources.length) * 100)), src, searchStats, logs);
+              if (idx > 0) {
+                await new Promise((resolve) => setTimeout(resolve, 250));
+              }
+              const searchUrl = getSearchUrlForSource(src, q, p);
+              if (!searchUrl) {
+                continue;
+              }
+
               try {
-                parsedResults = await parseWithAI(html, src, query);
-              } catch (aiErr: any) {
-                console.error("Gemini API error during AI search parsing:", aiErr);
-                logs.push(`[AI Error] Gemini AI failed on page ${p}: ${aiErr.message || aiErr}`);
-              }
-            }
+                const html = await fetchWithHeaders(searchUrl, src === "waybien" ? 0 : 2, 1000, srcExtraHeaders, src === "waybien" ? 8000 : 15000);
+                const baseUrl = getBaseUrlForSource(src);
+                let parsedResults: any[] = [];
 
-            // Diagnostic: if tgramsearch returns zero cards, capture a snippet of what we actually
-            // received so the next run shows *why* (bot-challenge page, empty shell, etc.) instead
-            // of just "0 results" with no further clue.
-            if (src === "tgramsearch" && parsedResults.length === 0) {
-              const snippet = html.replace(/\s+/g, " ").trim().slice(0, 220);
-              logs.push(`[Diagnostic] tgramsearch page ${p}: 0 cards parsed, HTML length=${html.length}. Snippet: "${snippet}"`);
-            }
+                if (mode === "fast") {
+                  parsedResults = parseWithSelectors(html, src, baseUrl);
+                  if (parsedResults.length === 0 && p === 1 && process.env.GEMINI_API_KEY) {
+                    addLog(`[Fallback] Page 1 selectors empty on ${src}. Trying smart AI parser...`);
+                    try {
+                      parsedResults = await parseWithAI(html, src, q);
+                    } catch (aiErr: any) {
+                      addLog(`[Fallback Warning] Gemini AI failed: ${aiErr.message || aiErr}`);
+                    }
+                  }
+                } else {
+                  try {
+                    parsedResults = await parseWithAI(html, src, q);
+                  } catch (aiErr: any) {
+                    addLog(`[AI Error] Gemini AI failed on page ${p}: ${aiErr.message || aiErr}`);
+                  }
+                }
 
-            // tgramsearch: fetch detail pages (/join/<id>) to extract tg://resolve or tg://join links + username
-            if (src === "tgramsearch" && parsedResults.length > 0) {
-               const chunkSize = 5;
-               for (let i = 0; i < parsedResults.length; i += chunkSize) {
-                 const chunk = parsedResults.slice(i, i + chunkSize);
-                 logs.push(`[Extraction] Fetching detail pages ${i + 1}–${Math.min(i + chunkSize, parsedResults.length)} of ${parsedResults.length}...`);
-                 await Promise.all(chunk.map(async (r: any) => {
-                   if (r.detailUrl && r.detailUrl.includes("/join/")) {
-                     try {
-                       const controller = new AbortController();
-                       const timeoutId = setTimeout(() => controller.abort(), 5000);
-                       const detRes = await fetch(r.detailUrl, {
-                         headers: { "User-Agent": CHROME_USER_AGENT, ...srcExtraHeaders },
-                         signal: controller.signal
-                       });
-                       clearTimeout(timeoutId);
-                       if (detRes.ok) {
-                          const dhtml = await detRes.text();
-                          const $d = cheerio.load(dhtml);
-                          // Primary: scan every <a> on the page for a tg://resolve or tg://join link —
-                          // not tied to a specific button class, since that markup isn't guaranteed.
-                          let btnHref: string | undefined;
-                          $d("a").each((_, el) => {
-                            const href = $d(el).attr("href") || "";
-                            if (href.startsWith("tg://resolve?domain=") || href.startsWith("tg://join?invite=")) {
-                              btnHref = href;
-                              return false; // break
-                            }
+                if (src === "tgramsearch" && parsedResults.length > 0) {
+                  const chunkSize = 5;
+                  for (let i = 0; i < parsedResults.length; i += chunkSize) {
+                    const chunk = parsedResults.slice(i, i + chunkSize);
+                    await Promise.all(chunk.map(async (r: any) => {
+                      if (r.detailUrl && r.detailUrl.includes("/join/")) {
+                        try {
+                          const controller = new AbortController();
+                          const timeoutId = setTimeout(() => controller.abort(), 5000);
+                          const detRes = await fetch(r.detailUrl, {
+                            headers: { "User-Agent": CHROME_USER_AGENT, ...srcExtraHeaders },
+                            signal: controller.signal
                           });
-                          if (btnHref) {
-                             r.telegramUrl = btnHref;
-                             r.extractionStatus = "success";
-                             if (btnHref.includes("resolve?domain=")) {
-                                 r.username = btnHref.split("domain=")[1];
-                             } else if (btnHref.includes("join?invite=")) {
-                                 r.username = btnHref.split("invite=")[1];
-                             }
-                          } else {
-                             // Fallback: regex scan raw HTML for tg:// links (covers links embedded
-                             // outside of <a> tags, e.g. in inline onclick handlers or data attributes)
-                             const tgMatch = dhtml.match(/tg:\/\/resolve\?domain=([a-zA-Z0-9_]{3,})/i)
-                                          || dhtml.match(/tg:\/\/join\?invite=([a-zA-Z0-9_]+)/i);
-                             if (tgMatch) {
-                               r.telegramUrl = tgMatch[0];
-                               r.username = tgMatch[1];
-                               r.extractionStatus = "success";
-                             }
-                          }
-                       }
-                     } catch (e) {
-                       // ignore timeouts to not crash the whole batch
-                     }
-                   }
-                 }));
-               }
-            }
-
-            // tgsearch: fetch detail pages (/channel/<id>) to extract tg://resolve or tg://join links + username + subs
-            if (src === "tgsearch" && parsedResults.length > 0) {
-               const chunkSize = 5;
-               for (let i = 0; i < parsedResults.length; i += chunkSize) {
-                 const chunk = parsedResults.slice(i, i + chunkSize);
-                 logs.push(`[Extraction] Fetching detail pages ${i + 1}–${Math.min(i + chunkSize, parsedResults.length)} of ${parsedResults.length}...`);
-                 await Promise.all(chunk.map(async (r: any) => {
-                   if (r.detailUrl && r.detailUrl.includes("/channel/")) {
-                     try {
-                       const controller = new AbortController();
-                       const timeoutId = setTimeout(() => controller.abort(), 5000);
-                       const detRes = await fetch(r.detailUrl, {
-                         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-                         signal: controller.signal
-                       });
-                       clearTimeout(timeoutId);
-                       if (detRes.ok) {
-                          const dhtml = await detRes.text();
-                          const $d = cheerio.load(dhtml);
-                          // Extract from .channel-detail__title a (tg://resolve?domain=...)
-                          const titleLink = $d(".channel-detail__title a").attr("href") || "";
-                          if (titleLink.startsWith("tg://")) {
-                            r.telegramUrl = titleLink;
-                            r.extractionStatus = "success";
-                            if (titleLink.includes("domain=")) r.username = titleLink.split("domain=")[1];
-                            else if (titleLink.includes("invite=")) r.username = titleLink.split("invite=")[1];
-                          }
-                          // Extract subscribers from .channel-detail__options li
-                          if (!r.subscribers || r.subscribers === "N/A") {
-                            $d(".channel-detail__options li").each((_, li) => {
-                              const text = $d(li).text().trim();
-                              if (text.match(/\d/) && !text.startsWith("@")) {
-                                r.subscribers = text.replace(/\s+/g, " ").trim();
+                          clearTimeout(timeoutId);
+                          if (detRes.ok) {
+                            const dhtml = await detRes.text();
+                            const $d = cheerio.load(dhtml);
+                            let btnHref: string | undefined;
+                            $d("a").each((_, el) => {
+                              const href = $d(el).attr("href") || "";
+                              if (href.startsWith("tg://resolve?domain=") || href.startsWith("tg://join?invite=")) {
+                                btnHref = href;
+                                return false;
                               }
                             });
-                          }
-                          // Extract username from .channel-detail__options li (second item)
-                          if (!r.username) {
-                            const optionsLis = $d(".channel-detail__options li");
-                            if (optionsLis.length >= 2) {
-                              const uText = $d(optionsLis[1]).text().trim();
-                              if (uText.startsWith("@")) r.username = uText.substring(1);
-                            }
-                          }
-                          // Fallback: regex scan for tg:// links
-                          if (!r.telegramUrl) {
-                            const tgMatch = dhtml.match(/tg:\/\/resolve\?domain=([a-zA-Z0-9_]{3,})/i)
-                                         || dhtml.match(/tg:\/\/join\?invite=([a-zA-Z0-9_]+)/i);
-                            if (tgMatch) {
-                              r.telegramUrl = tgMatch[0];
-                              r.username = tgMatch[1];
+                            if (btnHref) {
+                              r.telegramUrl = btnHref;
                               r.extractionStatus = "success";
+                              if (btnHref.includes("resolve?domain=")) r.username = btnHref.split("domain=")[1];
+                              else if (btnHref.includes("join?invite=")) r.username = btnHref.split("invite=")[1];
                             }
                           }
-                       }
-                     } catch (e) {
-                       // ignore timeouts
-                     }
-                   }
-                 }));
-               }
-            }
+                        } catch {}
+                      }
+                    }));
+                  }
+                }
 
-            // tgramcat: ALWAYS fetch detail pages to get t.me link from "Открыть" button
-            if (src === "tgramcat" && parsedResults.length > 0) {
-               const chunkSize = 5;
-               for (let i = 0; i < parsedResults.length; i += chunkSize) {
-                 const chunk = parsedResults.slice(i, i + chunkSize);
-                 logs.push(`[Extraction] Fetching detail pages ${i + 1}–${Math.min(i + chunkSize, parsedResults.length)} of ${parsedResults.length}...`);
-                 await Promise.all(chunk.map(async (r: any) => {
-                   if (r.detailUrl && r.detailUrl.includes("/channel/")) {
-                     try {
-                       const controller = new AbortController();
-                       const timeoutId = setTimeout(() => controller.abort(), 5000);
-                       const detRes = await fetch(r.detailUrl, {
-                         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-                         signal: controller.signal
-                       });
-                       clearTimeout(timeoutId);
-                       if (detRes.ok) {
-                          const dhtml = await detRes.text();
-                          // Look for t.me link in "Открыть" button: a.btn.btn-dark[href="https://t.me/..."]
-                          const tMeMatch = dhtml.match(/href="(https?:\/\/t\.me\/[a-zA-Z0-9_+]+)"/i);
-                          if (tMeMatch) {
-                            r.telegramUrl = tMeMatch[1];
-                            r.extractionStatus = "success";
-                            const userMatch = tMeMatch[1].match(/t\.me\/([a-zA-Z0-9_]+)/i);
-                            if (userMatch) r.username = userMatch[1];
-                          }
-                          // Also extract subs from detail page if missing
-                          if (!r.subscribers || r.subscribers === "N/A") {
+                if (src === "tgsearch" && parsedResults.length > 0) {
+                  const chunkSize = 5;
+                  for (let i = 0; i < parsedResults.length; i += chunkSize) {
+                    const chunk = parsedResults.slice(i, i + chunkSize);
+                    await Promise.all(chunk.map(async (r: any) => {
+                      if (r.detailUrl && r.detailUrl.includes("/channel/")) {
+                        try {
+                          const controller = new AbortController();
+                          const timeoutId = setTimeout(() => controller.abort(), 5000);
+                          const detRes = await fetch(r.detailUrl, {
+                            headers: { "User-Agent": CHROME_USER_AGENT },
+                            signal: controller.signal
+                          });
+                          clearTimeout(timeoutId);
+                          if (detRes.ok) {
+                            const dhtml = await detRes.text();
                             const $d = cheerio.load(dhtml);
-                            const metaText = $d(".mb-3.text-muted").first().text().trim();
-                            const subsMatch = metaText.match(/(\d[\d\s.,]*)\s*•/);
-                            if (subsMatch) r.subscribers = subsMatch[1].trim();
+                            const titleLink = $d(".channel-detail__title a").attr("href") || "";
+                            if (titleLink.startsWith("tg://")) {
+                              r.telegramUrl = titleLink;
+                              r.extractionStatus = "success";
+                              if (titleLink.includes("domain=")) r.username = titleLink.split("domain=")[1];
+                              else if (titleLink.includes("invite=")) r.username = titleLink.split("invite=")[1];
+                            }
                           }
-                       }
-                     } catch (e) {
-                       // ignore timeouts
-                     }
-                   }
-                 }));
-               }
-            }
+                        } catch {}
+                      }
+                    }));
+                  }
+                }
 
-            let rawCardCount = 0;
-            if (html) {
-              const $ = cheerio.load(html);
-              let cardSelector = ".search-result, .card, .channel-card, .search-item, .list-group-item, .tg-channel, .main-search-button-result-item, .main-search-button-result-item-wrapper";
-              if (src === "lyzem") {
-                cardSelector = ".search-result";
-              } else if (src === "tgramsearch") {
-                cardSelector = ".tg-channel";
-              } else if (src === "tgramcat") {
-                cardSelector = ".col:has(a[href^='/channel/'])";
+                if (src === "tgramcat" && parsedResults.length > 0) {
+                  const chunkSize = 5;
+                  for (let i = 0; i < parsedResults.length; i += chunkSize) {
+                    const chunk = parsedResults.slice(i, i + chunkSize);
+                    await Promise.all(chunk.map(async (r: any) => {
+                      if (r.detailUrl && r.detailUrl.includes("/channel/")) {
+                        try {
+                          const controller = new AbortController();
+                          const timeoutId = setTimeout(() => controller.abort(), 5000);
+                          const detRes = await fetch(r.detailUrl, {
+                            headers: { "User-Agent": CHROME_USER_AGENT },
+                            signal: controller.signal
+                          });
+                          clearTimeout(timeoutId);
+                          if (detRes.ok) {
+                            const dhtml = await detRes.text();
+                            const tMeMatch = dhtml.match(/href="(https?:\/\/t\.me\/[a-zA-Z0-9_+]+)"/i);
+                            if (tMeMatch) {
+                              r.telegramUrl = tMeMatch[1];
+                              r.extractionStatus = "success";
+                              const userMatch = tMeMatch[1].match(/t\.me\/([a-zA-Z0-9_]+)/i);
+                              if (userMatch) r.username = userMatch[1];
+                            }
+                          }
+                        } catch {}
+                      }
+                    }));
+                  }
+                }
+
+                let rawCardCount = parsedResults.length;
+                if (html) {
+                  const $ = cheerio.load(html);
+                  let cardSelector = ".search-result, .card, .channel-card, .search-item, .list-group-item, .tg-channel, .main-search-button-result-item, .main-search-button-result-item-wrapper";
+                  if (src === "lyzem") cardSelector = ".search-result";
+                  else if (src === "tgramsearch") cardSelector = ".tg-channel";
+                  else if (src === "tgramcat") cardSelector = ".col:has(a[href^='/channel/'])";
+                  rawCardCount = Math.max(parsedResults.length, $(cardSelector).length);
+                }
+
+                searchStats[src].pagesFetched++;
+                if (searchStats[src].rawCardsFound === undefined) searchStats[src].rawCardsFound = 0;
+                searchStats[src].rawCardsFound += rawCardCount;
+                searchStats[src].totalFound += parsedResults.length;
+
+                const tgLinksCount = parsedResults.filter((r: any) =>
+                  r.telegramUrl && (r.telegramUrl.includes("t.me") || r.telegramUrl.includes("telegram.me") || r.telegramUrl.includes("tgramsearch.com/join/") || r.telegramUrl.startsWith("tg://"))
+                ).length;
+                searchStats[src].tgLinksFound = (searchStats[src].tgLinksFound || 0) + tgLinksCount;
+
+                const pageAddedResults: any[] = [];
+                for (const item of parsedResults) {
+                  let dupKey = "";
+                  if (item.username) dupKey = `user:${item.username.toLowerCase()}`;
+                  else if (item.telegramUrl) {
+                    const m = item.telegramUrl.match(/(?:t\.me|telegram\.me|domain=|invite=)([a-zA-Z0-9_+-]+)/i);
+                    dupKey = m ? `link:${m[1].toLowerCase()}` : `url:${item.telegramUrl.toLowerCase()}`;
+                  } else if (item.detailUrl) dupKey = `detail:${item.detailUrl.toLowerCase()}`;
+                  else dupKey = `title:${item.title.toLowerCase()}`;
+
+                  if (!seenTitlesAndUrls.has(dupKey)) {
+                    seenTitlesAndUrls.add(dupKey);
+                    pageAddedResults.push(item);
+                  } else {
+                    searchStats[src].duplicatesFiltered++;
+                  }
+                }
+
+                if (pageAddedResults.length > 0) {
+                  saveResults(searchId, pageAddedResults);
+                  newResultsInBatchCount += pageAddedResults.length;
+                  searchStats[src].uniqueAdded += pageAddedResults.length;
+                  hasAnySuccess = true;
+                  addLog(`[Page] [Saved] ${pageAddedResults.length} channels saved from ${src}.`);
+                } else if (rawCardCount === 0) {
+                  consecutiveEmptyPages++;
+                  addLog(`[Page] [${p}] empty (${consecutiveEmptyPages} consecutive empty)`);
+                } else {
+                  addLog(`[Page] [${p}] ${src}: all results are duplicates`);
+                }
+
+                if (rawCardCount > 0) {
+                  consecutiveEmptyPages = 0;
+                  allPagesInBatchEmpty = false;
+                }
+
+                touchSearch(searchId, Math.min(99, Math.round(((sIdx + p / Math.max(maxPages, 1)) / sources.length) * 100)), src, searchStats, logs);
+              } catch (err: any) {
+                addLog(`[Error] ${src} (Page ${p}): ${err.message}`);
+                if (src === "waybien") {
+                  sourceUnavailable = true;
+                  break;
+                }
               }
-              rawCardCount = Math.max(
-                parsedResults.length,
-                $(cardSelector).length
-              );
+              if (isSearchCancelRequested(searchId)) {
+                addLog(`[Search] Cancel requested.`);
+                return;
+              }
             }
-            batchResults.push({ page: p, results: parsedResults, rawCardCount });
-          } catch (err: any) {
-            console.error(`Error processing ${src} page ${p}:`, err);
-            logs.push(`[Error] ${src} (Page ${p}): ${err.message}`);
-            batchResults.push({ page: p, results: [], rawCardCount: 0 });
-          }
-        }
 
-        // Sort batch results by page number to keep them in order
-        batchResults.sort((a, b) => a.page - b.page);
+            addLog(`[Scanning] ${src} batch done: +${newResultsInBatchCount} new, ${searchStats[src].duplicatesFiltered} dupes removed (total: ${searchStats[src].uniqueAdded})`);
 
-        let newResultsInBatchCount = 0;
-        let allPagesInBatchEmpty = true;
-
-        for (const pageRes of batchResults) {
-          searchStats[src].pagesFetched++;
-
-          if (searchStats[src].rawCardsFound === undefined) {
-             searchStats[src].rawCardsFound = 0;
-          }
-          searchStats[src].rawCardsFound += pageRes.rawCardCount || 0;
-
-          const isPageEmpty = pageRes.rawCardCount !== undefined ? pageRes.rawCardCount === 0 : pageRes.results.length === 0;
-
-          if (isPageEmpty) {
-            consecutiveEmptyPages++;
-            logs.push(`[Scanning] Page ${pageRes.page}: empty (${consecutiveEmptyPages} consecutive empty)`);
-            continue;
-          }
-
-          // Reset consecutiveEmptyPages since we found valid items
-          consecutiveEmptyPages = 0;
-          allPagesInBatchEmpty = false;
-
-          let uniqueOnPage = 0;
-          const pageAddedResults: any[] = [];
-
-          searchStats[src].totalFound += pageRes.results.length;
-          const tgLinksCount = pageRes.results.filter((r: any) => 
-            r.telegramUrl && (r.telegramUrl.includes("t.me") || r.telegramUrl.includes("telegram.me") || r.telegramUrl.includes("tgramsearch.com/join/") || r.telegramUrl.startsWith("tg://"))
-          ).length;
-          searchStats[src].tgLinksFound = (searchStats[src].tgLinksFound || 0) + tgLinksCount;
-
-          for (const item of pageRes.results) {
-            // Dedup by username or Telegram link — not by title (titles can repeat)
-            let dupKey = "";
-            if (item.username) {
-              dupKey = `user:${item.username.toLowerCase()}`;
-            } else if (item.telegramUrl) {
-              const m = item.telegramUrl.match(/(?:t\.me|telegram\.me|domain=|invite=)([a-zA-Z0-9_+-]+)/i);
-              dupKey = m ? `link:${m[1].toLowerCase()}` : `url:${item.telegramUrl.toLowerCase()}`;
-            } else if (item.detailUrl) {
-              dupKey = `detail:${item.detailUrl.toLowerCase()}`;
+            if (sourceUnavailable) {
+              addLog(`[Scanning] ${src}: source unavailable; skipping remaining pages.`);
+              hasMore = false;
+              searchStats[src].error = "Source unavailable";
+              searchStats[src].status = "failed";
+            } else if (consecutiveEmptyPages >= 3 || allPagesInBatchEmpty) {
+              addLog(`[Scanning] ${src}: end of directory reached (3+ empty pages). Stopping.`);
+              hasMore = false;
+            } else if (newResultsInBatchCount === 0 && !allPagesInBatchEmpty) {
+              addLog(`[Scanning] ${src}: only duplicates in batch. End of unique content. Stopping.`);
+              hasMore = false;
             } else {
-              dupKey = `title:${item.title.toLowerCase()}`;
+              page += batchSize;
             }
-            if (!seenTitlesAndUrls.has(dupKey)) {
-              seenTitlesAndUrls.add(dupKey);
-              uniqueOnPage++;
-              pageAddedResults.push(item);
-            } else {
-              searchStats[src].duplicatesFiltered++;
-            }
-          }
-
-          if (uniqueOnPage > 0) {
-            results.push(...pageAddedResults);
-            newResultsInBatchCount += uniqueOnPage;
-            searchStats[src].uniqueAdded += uniqueOnPage;
-          } else {
-            logs.push(`[Scanning] Page ${pageRes.page}: all results are duplicates`);
+          } catch (batchErr: any) {
+            addLog(`[Error] Batch starting at page ${page} failed: ${batchErr.message}`);
+            hasMore = false;
           }
         }
 
-        logs.push(`[Scanning] ${src} batch done: +${newResultsInBatchCount} new, ${searchStats[src].duplicatesFiltered} dupes removed (total: ${searchStats[src].uniqueAdded})`);
-
-        if (consecutiveEmptyPages >= 3 || allPagesInBatchEmpty) {
-          logs.push(`[Scanning] ${src}: end of directory reached (3+ empty pages). Stopping.`);
-          hasMore = false;
-        } else if (newResultsInBatchCount === 0 && !allPagesInBatchEmpty) {
-          // All pages returned results but every result was a duplicate — site re-serves same content on every page
-          logs.push(`[Scanning] ${src}: only duplicates in batch. End of unique content. Stopping.`);
-          hasMore = false;
-        } else {
-          page += batchSize;
+        if (searchStats[src].status !== "failed") {
+          searchStats[src]._completedQueries = searchStats[src]._completedQueries || [];
+          if (!searchStats[src]._completedQueries.includes(q)) searchStats[src]._completedQueries.push(q);
+          if (subQueries.every(sq => searchStats[src]._completedQueries.includes(sq))) {
+            searchStats[src].status = "completed";
+          }
         }
-      } catch (batchErr: any) {
-        console.error(`Error during batch processing of ${src}:`, batchErr);
-        logs.push(`[Error] Batch starting at page ${page} failed: ${batchErr.message}`);
-        hasMore = false;
       }
     }
-  }
   } catch (fatalErr: any) {
-    // Without this, an uncaught error anywhere in the loop above (e.g. a source's
-    // session-cookie warmup or an unexpected parser throw) would leave the request
-    // hanging with no response — and every log line collected so far would be lost,
-    // since res.json() below is the only place logs are ever sent to the client.
     console.error(`[Fatal] /api/search crashed while processing sources:`, fatalErr);
-    logs.push(`[Fatal Error] Search crashed: ${fatalErr.message || fatalErr}. Returning partial results collected so far.`);
+    searchFailed = true;
+    addLog(`[Fatal Error] Search crashed: ${fatalErr.message || fatalErr}. Returning partial results collected so far.`);
+  } finally {
+    const isCancelled = isSearchCancelRequested(searchId);
+    const currentStatus = getSearchStatus(userId, searchId)?.status;
+    if (isCancelled || currentStatus === "cancelled") {
+      completeSearch(searchId, userId, searchStats, logs, "cancelled");
+    } else {
+      const allFailed = Object.values(searchStats).length > 0 && Object.values(searchStats).every((s: any) => s.status === "failed");
+      const finalStatus = searchFailed || allFailed ? "failed" : "completed";
+      completeSearch(searchId, userId, searchStats, logs, finalStatus, searchFailed ? "Search worker failed." : (allFailed ? "All sources failed." : null));
+    }
+    activeSearches.delete(userId);
+    activeGlobalJobCount = Math.max(0, activeGlobalJobCount - 1);
+    startQueuedSearches();
   }
+}
 
-  res.json({ results, logs, searchStats });
+export function startQueuedSearches() {
+  while (activeGlobalJobCount < MAX_GLOBAL_CONCURRENT_SEARCHES) {
+    const queued = listQueuedSearches();
+    const next = queued.find(j => !activeSearches.has(j.user_id));
+    if (!next) break;
+    if (!claimSearch(next.id)) continue;
+    activeGlobalJobCount++;
+    void runSearchJob(next.user_id, next.id, { query: next.query, source: next.source, mode: next.mode, limitPages: next.limit_pages })
+      .catch((error: any) => completeSearch(next.id, next.user_id, {}, [`[${new Date().toISOString()}] [Fatal Error] ${error.message}`], "failed", error.message));
+  }
+}
+
+// Endpoint to Search Catalogs
+app.post("/api/search", requireUser, (req: AuthenticatedRequest, res: express.Response) => {
+  let input: { query: string; source: string; mode: "fast" | "ai"; limitPages: number };
+  try { input = safeSearchInput(req.body); } catch (error: any) {
+    res.status(400).json({ error: error.message });
+    return;
+  }
+  const requestId = typeof req.body?.requestId === "string" ? req.body.requestId.slice(0, 100) : undefined;
+  const searchId = createSearch(req.user!.id, { ...input, requestId });
+  const status = getSearchStatus(req.user!.id, searchId)!;
+  if (status.status === "queued" && activeGlobalJobCount < MAX_GLOBAL_CONCURRENT_SEARCHES && !activeSearches.has(req.user!.id)) {
+    if (claimSearch(searchId)) {
+      activeGlobalJobCount++;
+      void (async () => {
+        try {
+          await runSearchJob(req.user!.id, searchId, input);
+        } catch (error: any) {
+          console.error(`[Worker] Search ${searchId} failed before execution:`, error);
+          completeSearch(searchId, req.user!.id, {}, [`[${new Date().toISOString()}] [Fatal Error] ${error.message}`], "failed", error.message);
+        }
+      })();
+    }
+  } else if (status.status === "queued") {
+    startQueuedSearches();
+  }
+  const currentStatus = getSearchStatus(req.user!.id, searchId)!;
+  res.status(202).json({ searchId: String(searchId), status: currentStatus.status });
+});
+
+app.get("/api/searches/:id/status", requireUser, (req: AuthenticatedRequest, res) => {
+  const status = getSearchStatus(req.user!.id, Number(req.params.id));
+  if (!status) return res.status(404).json({ error: "Search was not found." });
+  res.json(status);
+});
+
+app.post("/api/searches/:id/cancel", requireUser, (req: AuthenticatedRequest, res) => {
+  if (!requestSearchCancel(req.user!.id, Number(req.params.id))) return res.status(404).json({ error: "Active search was not found." });
+  res.status(202).json({ status: "cancelling" });
 });
 
 // Gemini-powered search scraper parser
@@ -1156,7 +1501,7 @@ async function parseWithAI(html: string, source: string, query: string): Promise
   const ai = getGeminiClient();
 
   const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash",
+    model: "gemini-2.5-flash",
     contents: `You are an expert AI scraper. Analyze this cleaned HTML of a Telegram catalog search result for "${query}".
 Extract all listed channel/group cards.
 
@@ -1220,13 +1565,15 @@ Return ONLY the raw JSON array. Do not put markdown blocks or any conversational
 }
 
 // Endpoint to Extract Telegram Links
-app.post("/api/extract-link", async (req: express.Request, res: express.Response) => {
-  const { detailUrl, mode = "fast" } = req.body;
-
-  if (!detailUrl) {
-    res.status(400).json({ error: "Detail URL is required." });
+app.post("/api/extract-link", requireUser, async (req: AuthenticatedRequest, res: express.Response) => {
+  const resultId = Number(req.body?.resultId);
+  const existing = Number.isInteger(resultId) ? getResult(req.user!.id, resultId) : null;
+  if (!existing) {
+    res.status(404).json({ error: "Saved result was not found." });
     return;
   }
+  const { detailUrl } = existing;
+  const mode = req.body?.mode === "ai" ? "ai" : "fast";
 
   const logs: string[] = [`Extracting direct Telegram link for: ${detailUrl}`];
 
@@ -1257,13 +1604,31 @@ app.post("/api/extract-link", async (req: express.Request, res: express.Response
       }
     }
 
-    res.json({
-      success: !!result?.telegramUrl,
-      telegramUrl: result?.telegramUrl || null,
-      username: result?.username || null,
+    const similarChannels = extractSimilarChannelsFromHtml(html, detailUrl);
+    const resolvedUrl = normalizeTelegramLink(result?.telegramUrl) || normalizeTelegramLink(existing.telegramUrl);
+    const resolvedUsername = resolvedUrl && !resolvedUrl.includes("/+") ? resolvedUrl.split("/").pop() : null;
+    let preview: any = null;
+    if (resolvedUrl) {
+      try { preview = await enrichTelegramPreview(resolvedUrl); logs.push("Telegram preview: metadata updated."); }
+      catch (previewError: any) { logs.push(`Telegram preview unavailable: ${previewError.message}`); }
+    }
+    const savedResult = updateResult(req.user!.id, resultId, {
+      title: preview?.title || existing.title,
+      description: preview?.description || result?.channelDescription || existing.description,
+      imageUrl: preview?.imageUrl || existing.imageUrl || null,
+      subscribers: preview?.subscribers || existing.subscribers || null,
+      chatType: preview?.chatType || existing.chatType || "unknown",
+      telegramUrl: resolvedUrl || existing.telegramUrl || null,
+      username: resolvedUsername || result?.username || existing.username || null,
       channelDescription: result?.channelDescription || null,
       stats: result?.stats || null,
-      similarChannels: extractSimilarChannelsFromHtml(html, detailUrl),
+      similarChannels,
+      extractionStatus: resolvedUrl ? "success" : "failed",
+      error: resolvedUrl ? null : "No link found on page",
+    });
+    res.json({
+      success: !!result?.telegramUrl,
+      result: savedResult,
       logs,
     });
   } catch (err: any) {
@@ -1350,7 +1715,7 @@ async function extractLinkWithAI(html: string): Promise<any> {
   const ai = getGeminiClient();
 
   const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash",
+    model: "gemini-2.5-flash",
     contents: `You are a precise AI web scraper. Your job is to extract the direct Telegram channel/group subscription/joining link from this catalog detail page.
 Look for any t.me links, telegram.me links, or tg:// links, or extract the channel's username.
 
@@ -1478,6 +1843,7 @@ function extractSimilarChannelsFromHtml(html: string, detailUrl: string): any[] 
 // ---------------- SERVER AND VITE DEV SETUP ----------------
 
 async function startServer() {
+  await bootstrapOwner();
   // Vite middleware setup
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1498,4 +1864,6 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.NODE_ENV !== "test") {
+  startServer();
+}

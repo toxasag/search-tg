@@ -66,7 +66,7 @@ export default function Header({ apiKeyMissing }: HeaderProps) {
           <div className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#15181E] border border-slate-800 font-mono text-slate-300">
             <Cpu className="w-3.5 h-3.5 text-blue-400" />
             <span className="font-semibold uppercase tracking-wider text-[10px]">
-              Engine: Gemini 3.5 Flash
+              Engine: Gemini 2.5 Flash
             </span>
           </div>
 

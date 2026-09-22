@@ -1,0 +1,19 @@
+services:
+  search-tg:
+    build: .
+    container_name: search-tg
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /app/data/search-tg.sqlite
+    volumes:
+      - ./data:/app/data
+    networks:
+      - proxy_network
+    expose:
+      - "3000"
+
+networks:
+  proxy_network:
+    external: true

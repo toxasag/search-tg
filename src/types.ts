@@ -1,11 +1,12 @@
 export interface ScrapedChannel {
   id: string;
+  searchId?: string;
   title: string;
   description: string;
   subscribers: string | null;
   detailUrl: string;
   imageUrl: string | null;
-  source: string; // Allows merged sources (e.g., "tgsearch, tgramcat")
+  source: string;
   telegramUrl: string | null;
   username: string | null;
   channelDescription: string | null;
@@ -29,11 +30,31 @@ export interface SearchStats {
 }
 
 export interface SearchQueryHistory {
+  id: string;
   query: string;
-  source: string;
-  mode: "fast" | "ai";
+  source: SearchSource;
+  mode: ParseMode;
+  limitPages?: number;
+  status?: "running" | "completed" | "failed";
+  resultCount?: number;
   timestamp: string;
 }
 
+export interface CurrentUser {
+  id: number;
+  email: string;
+  role: "owner" | "user";
+  mustChangePassword: boolean;
+}
+
+export interface ManagedUser {
+  id: number;
+  email: string;
+  role: "owner" | "user";
+  is_active: number;
+  must_change_password: number;
+  created_at: string;
+}
+
 export type ParseMode = "fast" | "ai";
-export type SearchSource = "all" | "tgsearch" | "tgramcat" | "tgramsearch" | "waybien" | "lyzem";
+export type SearchSource = "all" | "tgsearch" | "tgramcat" | "tgramsearch" | "waybien" | "lyzem" | "tgcat" | "catalogTelegram" | "tglib" | "telegram";

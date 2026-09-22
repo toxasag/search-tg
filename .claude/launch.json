@@ -1,0 +1,9 @@
+{
+  "version": "0.0.1",
+  "configurations": [{
+    "name": "search-test",
+    "runtimeExecutable": "env",
+    "runtimeArgs": ["PORT=3107", "DATABASE_PATH=/tmp/search-tg-preview-20260921.sqlite", "BOOTSTRAP_OWNER_EMAIL=preview@example.test", "BOOTSTRAP_OWNER_PASSWORD=preview-test-password-only", "HTTPS_PROXY=", "HTTP_PROXY=", "ALL_PROXY=", "GEMINI_API_KEY=", "npm", "run", "dev"],
+    "port": 3107
+  }]
+}
