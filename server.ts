@@ -6,7 +6,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import * as cheerio from "cheerio";
 import dotenv from "dotenv";
 import { setGlobalDispatcher, ProxyAgent } from "undici";
-import { db, recoverStaleSearches, isDatabaseEmpty } from "./server/db.js";
+import { db, recoverStaleSearches, isDatabaseEmpty, getCachedChannel, putCachedChannel } from "./server/db.js";
 import { normalizeTelegramLink } from "./src/telegram-links.js";
 import { EXTRA_CATALOGS, fetchCatalogPage } from "./server/catalog-sources.js";
 import { telegramConfigured, searchTelegram } from "./server/telegram-discovery.js";
@@ -42,6 +42,7 @@ import {
   updateResult,
   searchCachedChannels,
   resultKey,
+  isBotTarget,
 } from "./server/store.js";
 import { filterAndRankByRelevance, calculateRelevance } from "./server/relevance.js";
 
@@ -858,16 +859,21 @@ let importWorkerState: ImportWorkerState = {
   lastUpdated: new Date().toISOString()
 };
 
-async function runBackgroundEnrichment(userId: number, searchId?: number) {
+async function runBackgroundEnrichment(userId: number, searchId?: number, isGlobal?: boolean) {
   if (importWorkerState.running) return;
   importWorkerState.running = true;
 
   try {
-    const query = searchId
-      ? `SELECT r.id, r.telegram_url FROM search_results r WHERE r.search_id=? AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown')`
-      : `SELECT r.id, r.telegram_url FROM search_results r JOIN searches s ON s.id=r.search_id WHERE s.user_id=? AND r.source='import' AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown') LIMIT 3000`;
-    const params = searchId ? [searchId] : [userId];
-    const rows = db.prepare(query).all(...params) as { id: number; telegram_url: string }[];
+    let rows: any[] = [];
+    if (isGlobal) {
+      rows = db.prepare(`SELECT dedup_key as id, telegram_url FROM channels WHERE telegram_url IS NOT NULL AND chat_type != 'bot' AND telegram_url NOT LIKE '%_bot' AND (image_url IS NULL OR description='' OR chat_type='unknown') LIMIT 5000`).all();
+    } else {
+      const query = searchId
+        ? `SELECT r.id, r.telegram_url FROM search_results r WHERE r.search_id=? AND r.chat_type != 'bot' AND r.telegram_url NOT LIKE '%_bot' AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown')`
+        : `SELECT r.id, r.telegram_url FROM search_results r JOIN searches s ON s.id=r.search_id WHERE s.user_id=? AND r.source='import' AND r.chat_type != 'bot' AND r.telegram_url NOT LIKE '%_bot' AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown') LIMIT 3000`;
+      const params = searchId ? [searchId] : [userId];
+      rows = db.prepare(query).all(...params) as { id: number; telegram_url: string }[];
+    }
 
     importWorkerState.total = rows.length;
     importWorkerState.processed = 0;
@@ -877,6 +883,7 @@ async function runBackgroundEnrichment(userId: number, searchId?: number) {
 
     const BATCH_SIZE = 5;
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      if (!importWorkerState.running) break;
       const batch = rows.slice(i, i + BATCH_SIZE);
       await Promise.all(batch.map(async (row) => {
         try {
@@ -885,20 +892,76 @@ async function runBackgroundEnrichment(userId: number, searchId?: number) {
             importWorkerState.processed++;
             return;
           }
+          if (isBotTarget(url)) {
+            db.prepare("DELETE FROM channels WHERE dedup_key = ? OR telegram_url = ?").run(row.id, url);
+            db.prepare("DELETE FROM search_results WHERE telegram_url = ?").run(url);
+            importWorkerState.processed++;
+            return;
+          }
           const preview = await enrichTelegramPreview(url);
-          const existing = getResult(userId, row.id);
-          if (existing) {
-            updateResult(userId, row.id, {
-              title: preview.title,
-              description: preview.description,
-              imageUrl: preview.imageUrl,
-              subscribers: preview.subscribers,
-              chatType: preview.chatType,
-              telegramUrl: url,
-              username: url.includes('/+') ? null : url.split('/').pop() || null,
-              extractionStatus: preview.chatType === 'unknown' ? 'pending' : 'success'
-            });
-            importWorkerState.enriched++;
+          if (preview.chatType === "bot" || isBotTarget(url, null, preview.title, preview.chatType)) {
+            db.prepare("DELETE FROM channels WHERE dedup_key = ? OR telegram_url = ?").run(row.id, url);
+            db.prepare("DELETE FROM search_results WHERE telegram_url = ?").run(url);
+            importWorkerState.processed++;
+            return;
+          }
+          if (isGlobal) {
+            const existing = getCachedChannel(row.id);
+            if (existing) {
+              putCachedChannel(row.id, {
+                ...existing,
+                title: preview.title || existing.title,
+                description: preview.description || existing.description,
+                imageUrl: preview.imageUrl || existing.imageUrl,
+                subscribers: preview.subscribers || existing.subscribers,
+                chatType: preview.chatType !== 'unknown' ? preview.chatType : existing.chatType,
+                extractionStatus: preview.chatType === 'unknown' ? 'pending' : 'success'
+              });
+              db.prepare(`UPDATE search_results SET 
+                title = COALESCE(NULLIF(?, ''), title), 
+                description = COALESCE(NULLIF(?, ''), description), 
+                image_url = COALESCE(NULLIF(?, ''), image_url), 
+                subscribers = COALESCE(NULLIF(?, ''), subscribers), 
+                chat_type = CASE WHEN ? = 'unknown' THEN chat_type ELSE ? END, 
+                extraction_status = 'success' 
+                WHERE telegram_url = ?`).run(
+                preview.title || null,
+                preview.description || null,
+                preview.imageUrl || null,
+                preview.subscribers || null,
+                preview.chatType,
+                preview.chatType,
+                url
+              );
+              importWorkerState.enriched++;
+            }
+          } else {
+            const existing = getResult(userId, row.id);
+            if (existing) {
+              updateResult(userId, row.id, {
+                title: preview.title || existing.title,
+                description: preview.description || existing.description,
+                imageUrl: preview.imageUrl || existing.imageUrl,
+                subscribers: preview.subscribers || existing.subscribers,
+                chatType: preview.chatType !== 'unknown' ? preview.chatType : existing.chatType,
+                telegramUrl: url,
+                username: url.includes('/+') ? null : url.split('/').pop() || null,
+                extractionStatus: preview.chatType === 'unknown' ? 'pending' : 'success'
+              });
+              const cached = getCachedChannel(row.id) || getCachedChannel(`telegram:${url}`);
+              if (cached) {
+                putCachedChannel(row.id, {
+                  ...cached,
+                  title: preview.title || cached.title,
+                  description: preview.description || cached.description,
+                  imageUrl: preview.imageUrl || cached.imageUrl,
+                  subscribers: preview.subscribers || cached.subscribers,
+                  chatType: preview.chatType !== 'unknown' ? preview.chatType : cached.chatType,
+                  extractionStatus: preview.chatType === 'unknown' ? 'pending' : 'success'
+                });
+              }
+              importWorkerState.enriched++;
+            }
           }
         } catch {
           importWorkerState.failed++;
@@ -927,9 +990,15 @@ app.post("/api/import", requireUser, async (req: AuthenticatedRequest, res) => {
   let alreadyStored = 0;
 
   for (const url of unique) {
+    if (isBotTarget(url)) {
+      continue;
+    }
     const key = `telegram:${url}`;
     const cached = getCachedChannel(key);
     if (cached) {
+      if (isBotTarget(cached.telegramUrl || url, cached.username, cached.title, cached.chatType)) {
+        continue;
+      }
       fromBase++;
       alreadyStored++;
       imported.push({
@@ -946,15 +1015,32 @@ app.post("/api/import", requireUser, async (req: AuthenticatedRequest, res) => {
       });
       continue;
     }
+    let chatType = "unknown";
+    const urlLower = url.toLowerCase();
+    if (urlLower.includes("+") || urlLower.includes("joinchat")) {
+      chatType = "closed";
+    } else if (urlLower.endsWith("_bot") || urlLower.endsWith("bot")) {
+      continue;
+    } else if (urlLower.includes("chat") || urlLower.includes("group") || urlLower.includes("talk") || urlLower.includes("club") || urlLower.includes("besedka") || urlLower.includes("boltalka")) {
+      chatType = "group";
+    } else if (urlLower.includes("channel") || urlLower.includes("kanal") || urlLower.includes("news")) {
+      chatType = "channel";
+    }
+
+    const username = (url.includes("+") || url.includes("joinchat")) ? null : url.split("/").pop() || null;
+    if (isBotTarget(url, username, null, chatType)) {
+      continue;
+    }
+
     const item: any = {
       title: url.replace("https://t.me/", "@"),
       description: "",
       detailUrl: url,
       source: "import",
       telegramUrl: url,
-      username: url.split("/").pop() || null,
+      username,
       extractionStatus: "pending",
-      chatType: url.includes("+") ? "closed" : "unknown"
+      chatType
     };
     imported.push(item);
   }
@@ -981,6 +1067,172 @@ app.post("/api/import/enrich", requireUser, async (req: AuthenticatedRequest, re
 
 app.get("/api/import/enrich/status", requireUser, (_req, res) => {
   res.json(importWorkerState);
+});
+app.post("/api/database/enrich", requireUser, async (req: AuthenticatedRequest, res) => {
+  const userId = req.user!.id;
+  if (!importWorkerState.running) {
+    void runBackgroundEnrichment(userId, undefined, true);
+  }
+  res.json({ status: "started", ...importWorkerState });
+});
+
+app.get("/api/database/enrich/status", requireUser, (_req, res) => {
+  res.json(importWorkerState);
+});
+
+app.get("/api/database/channels", requireUser, (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page as string) || 1);
+  const pageSize = Math.min(1000, Math.max(1, parseInt(req.query.pageSize as string) || 50));
+  const query = (req.query.query as string || "").trim();
+  const searchField = req.query.searchField as string || "all";
+  const chatType = req.query.chatType as string || "all";
+  
+  let sql = "SELECT * FROM channels WHERE (chat_type != 'bot' AND telegram_url NOT LIKE '%_bot' AND (username IS NULL OR (username NOT LIKE '%bot' AND username NOT LIKE '%_bot')))";
+  const params: any[] = [];
+  
+  if (query) {
+    if (searchField === "title") {
+      sql += " AND (title LIKE ? OR username LIKE ?)";
+      params.push(`%${query}%`, `%${query}%`);
+    } else if (searchField === "description") {
+      sql += " AND (description LIKE ? OR channel_description LIKE ?)";
+      params.push(`%${query}%`, `%${query}%`);
+    } else {
+      sql += " AND (title LIKE ? OR description LIKE ? OR channel_description LIKE ? OR username LIKE ? OR telegram_url LIKE ?)";
+      params.push(`%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`);
+    }
+  }
+  
+  if (chatType !== "all") {
+    sql += " AND chat_type = ?";
+    params.push(chatType);
+  }
+  
+  const countSql = sql.replace("SELECT *", "SELECT COUNT(*) as c");
+  const totalCount = (db.prepare(countSql).get(...params) as any).c;
+  
+  sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?";
+  params.push(pageSize, (page - 1) * pageSize);
+  
+  const channels = db.prepare(sql).all(...params);
+  
+  const typeCounts = db.prepare("SELECT chat_type, COUNT(*) as c FROM channels WHERE (chat_type != 'bot' AND telegram_url NOT LIKE '%_bot' AND (username IS NULL OR (username NOT LIKE '%bot' AND username NOT LIKE '%_bot'))) GROUP BY chat_type").all() as any[];
+  const stats: Record<string, number> = { total: 0, channels: 0, groups: 0, closed: 0, unknown: 0 };
+  let totalChannels = 0;
+  for (const row of typeCounts) {
+    const t = row.chat_type || "unknown";
+    const count = Number(row.c) || 0;
+    totalChannels += count;
+    if (t === "channel") stats.channels = count;
+    else if (t === "group") stats.groups = count;
+    else if (t === "closed") stats.closed = count;
+    else if (t === "unknown") stats.unknown = count;
+  }
+  stats.total = totalChannels;
+  
+  res.json({
+    channels: channels.map((r: any) => ({
+      id: r.dedup_key,
+      title: r.title,
+      description: r.description,
+      subscribers: r.subscribers,
+      detailUrl: r.detail_url,
+      imageUrl: r.image_url,
+      source: r.source,
+      telegramUrl: r.telegram_url,
+      username: r.username,
+      channelDescription: r.channel_description,
+      stats: r.stats ? JSON.parse(r.stats) : null,
+      extractionStatus: r.extraction_status,
+      chatType: r.chat_type,
+      error: r.error,
+      similarChannels: r.similar_channels ? JSON.parse(r.similar_channels) : null,
+      firstSeenAt: r.first_seen_at,
+      updatedAt: r.updated_at
+    })),
+    totalCount,
+    page,
+    pageSize,
+    totalPages: Math.ceil(totalCount / pageSize),
+    stats
+  });
+});
+
+app.post("/api/database/export", requireUser, (req, res) => {
+  const { query, searchField = "all", chatType = "all", ids, format = "txt" } = req.body || {};
+  
+  let sql = "SELECT * FROM channels WHERE (chat_type != 'bot' AND telegram_url NOT LIKE '%_bot' AND (username IS NULL OR (username NOT LIKE '%bot' AND username NOT LIKE '%_bot')))";
+  const params: any[] = [];
+  
+  if (Array.isArray(ids) && ids.length > 0) {
+    const placeholders = ids.map(() => "?").join(",");
+    sql += ` AND dedup_key IN (${placeholders})`;
+    params.push(...ids);
+  } else {
+    if (query) {
+      if (searchField === "title") {
+        sql += " AND (title LIKE ? OR username LIKE ?)";
+        params.push(`%${query}%`, `%${query}%`);
+      } else if (searchField === "description") {
+        sql += " AND (description LIKE ? OR channel_description LIKE ?)";
+        params.push(`%${query}%`, `%${query}%`);
+      } else {
+        sql += " AND (title LIKE ? OR description LIKE ? OR channel_description LIKE ? OR username LIKE ? OR telegram_url LIKE ?)";
+        params.push(`%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`);
+      }
+    }
+    if (chatType && chatType !== "all") {
+      sql += " AND chat_type = ?";
+      params.push(chatType);
+    }
+  }
+  
+  sql += " ORDER BY updated_at DESC LIMIT 50000";
+  const rows = db.prepare(sql).all(...params) as any[];
+  const timestamp = new Date().toISOString().split("T")[0];
+  
+  if (format === "csv") {
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="telegram_channels_${timestamp}.csv"`);
+    res.write("\uFEFF"); // UTF-8 BOM for Excel
+    res.write("Title,Username,Subscribers,Type,Telegram URL,Description\n");
+    for (const r of rows) {
+      const esc = (v: string | null) => `"${(v || "").replace(/"/g, '""')}"`;
+      res.write(`${esc(r.title)},${esc(r.username)},${esc(r.subscribers)},${esc(r.chat_type)},${esc(r.telegram_url)},${esc(r.description || r.channel_description)}\n`);
+    }
+    return res.end();
+  }
+  
+  if (format === "json") {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="telegram_channels_${timestamp}.json"`);
+    return res.json(rows.map(r => ({
+      title: r.title,
+      username: r.username,
+      subscribers: r.subscribers,
+      chatType: r.chat_type,
+      telegramUrl: r.telegram_url,
+      description: r.description || r.channel_description,
+      imageUrl: r.image_url,
+      source: r.source
+    })));
+  }
+  
+  if (format === "txt_report") {
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="telegram_report_${timestamp}.txt"`);
+    for (const r of rows) {
+      res.write(`Название: ${r.title || "—"}\nЮзернейм: ${r.username ? "@" + r.username : "—"}\nАудитория: ${r.subscribers || "—"}\nТип: ${r.chat_type || "unknown"}\nСсылка: ${r.telegram_url || "—"}\nОписание: ${r.description || r.channel_description || "—"}\n\n`);
+    }
+    return res.end();
+  }
+  
+  // Default: Pure TXT links
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="telegram_links_${timestamp}.txt"`);
+  const urls = rows.map(r => r.telegram_url).filter(Boolean);
+  res.write(Array.from(new Set(urls)).join("\n") + "\n");
+  return res.end();
 });
 
 app.get("/api/admin/searches", requireOwner, (_req, res) => {
@@ -1087,9 +1339,38 @@ async function enrichTelegramPreview(url: string) {
   }
 
   const extra = $(".tgme_page_extra").text().trim();
-  const subscribers = extra.match(/[\d.,KMB]+\s+(?:subscribers|members)/i)?.[0] || null;
-  const lower = `${extra} ${$(".tgme_page_action").text()}`.toLowerCase();
-  const chatType = /members|join group|chat/.test(lower) ? "group" : /subscribers|view channel/.test(lower) ? "channel" : url.includes("+") || url.includes("joinchat") ? "closed" : "unknown";
+  const actionText = $(".tgme_page_action").text().trim();
+  const subscribers = extra.match(/[\d.,KMB]+\s+(?:subscribers|members|подписчиков|участников)/i)?.[0] || null;
+  
+  const titleLower = title.toLowerCase();
+  const descLower = description.toLowerCase();
+  const urlLower = url.toLowerCase();
+  const actionLower = actionText.toLowerCase();
+  const extraLower = extra.toLowerCase();
+  
+  let chatType = "unknown";
+  
+  if (urlLower.includes("+") || urlLower.includes("joinchat")) {
+    chatType = "closed";
+  } else if (urlLower.endsWith("_bot")) {
+    chatType = "bot";
+  } else if (actionLower.includes("send message")) {
+    chatType = "contact";
+  } else if (actionLower.includes("start bot")) {
+    chatType = "bot";
+  } else if (actionLower.includes("join group") || extraLower.includes("members") || extraLower.includes("участников") || extraLower.includes("online")) {
+    chatType = "group";
+  } else if (actionLower.includes("view channel") || extraLower.includes("subscribers") || extraLower.includes("подписчиков")) {
+    chatType = "channel";
+  } else {
+    const groupKeywords = ["чат", "chat", "болталка", "беседка", "флудилка", "группа", "group", "клуб"];
+    const channelKeywords = ["канал", "channel"];
+    if (groupKeywords.some(kw => titleLower.includes(kw) || descLower.includes(kw) || urlLower.includes(kw))) {
+      chatType = "group";
+    } else if (channelKeywords.some(kw => titleLower.includes(kw) || descLower.includes(kw))) {
+      chatType = "channel";
+    }
+  }
 
   return {
     title: title || url.replace("https://t.me/", "@"),
@@ -2045,10 +2326,46 @@ function extractSimilarChannelsFromHtml(html: string, detailUrl: string): any[] 
   return similarChannels;
 }
 
+function runStartupHeuristics() {
+  try {
+    // Purge all bots from channels and search_results tables
+    db.prepare(`DELETE FROM channels WHERE 
+      chat_type = 'bot' 
+      OR telegram_url LIKE '%_bot' 
+      OR username LIKE '%_bot' 
+      OR LOWER(telegram_url) GLOB '*bot' 
+      OR LOWER(username) GLOB '*bot'
+      OR LOWER(title) GLOB '* bot'
+      OR LOWER(title) LIKE 'telegram: contact @%bot'
+    `).run();
+
+    db.prepare(`DELETE FROM search_results WHERE 
+      chat_type = 'bot' 
+      OR telegram_url LIKE '%_bot' 
+      OR username LIKE '%_bot' 
+      OR LOWER(telegram_url) GLOB '*bot' 
+      OR LOWER(username) GLOB '*bot'
+      OR LOWER(title) GLOB '* bot'
+      OR LOWER(title) LIKE 'telegram: contact @%bot'
+    `).run();
+
+    db.prepare("UPDATE channels SET chat_type = 'closed' WHERE (chat_type = 'unknown' OR chat_type IS NULL) AND (telegram_url LIKE '%+%' OR telegram_url LIKE '%/joinchat/%')").run();
+    db.prepare("UPDATE channels SET chat_type = 'group' WHERE (chat_type = 'unknown' OR chat_type IS NULL) AND (LOWER(title) LIKE '%чат%' OR LOWER(title) LIKE '%chat%' OR LOWER(title) LIKE '%группа%' OR LOWER(title) LIKE '%group%' OR LOWER(title) LIKE '%беседка%' OR LOWER(title) LIKE '%болталка%' OR LOWER(telegram_url) LIKE '%chat%' OR LOWER(telegram_url) LIKE '%group%')").run();
+    db.prepare("UPDATE channels SET chat_type = 'channel' WHERE (chat_type = 'unknown' OR chat_type IS NULL) AND (LOWER(title) LIKE '%канал%' OR LOWER(title) LIKE '%channel%')").run();
+
+    db.prepare("UPDATE search_results SET chat_type = 'closed' WHERE (chat_type = 'unknown' OR chat_type IS NULL) AND (telegram_url LIKE '%+%' OR telegram_url LIKE '%/joinchat/%')").run();
+    db.prepare("UPDATE search_results SET chat_type = 'group' WHERE (chat_type = 'unknown' OR chat_type IS NULL) AND (LOWER(title) LIKE '%чат%' OR LOWER(title) LIKE '%chat%' OR LOWER(title) LIKE '%группа%' OR LOWER(title) LIKE '%group%' OR LOWER(title) LIKE '%беседка%' OR LOWER(title) LIKE '%болталка%' OR LOWER(telegram_url) LIKE '%chat%' OR LOWER(telegram_url) LIKE '%group%')").run();
+    db.prepare("UPDATE search_results SET chat_type = 'channel' WHERE (chat_type = 'unknown' OR chat_type IS NULL) AND (LOWER(title) LIKE '%канал%' OR LOWER(title) LIKE '%channel%')").run();
+  } catch (e) {
+    console.warn("[Heuristics] Startup notice:", e);
+  }
+}
+
 // ---------------- SERVER AND VITE DEV SETUP ----------------
 
 async function startServer() {
   await bootstrapOwner();
+  runStartupHeuristics();
   // Vite middleware setup
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

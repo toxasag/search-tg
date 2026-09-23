@@ -74,8 +74,20 @@ export function parseTglibSearch(body: string, page: number) {
     const href = link.attr("href") || "";
     if (!/^https:\/\/tglib\.net\/(?:ru|en)\/(?:channels|groups)\/\d+(?:\/)?$/.test(href)) return;
     if (results.some(r => r.detailUrl === href)) return;
-    results.push({ title: link.text().trim(), detailUrl: href, source: "tglib",
-      description: $(el).find(".b-serp-item__text").text().trim(), extractionStatus: "pending",
+
+    let title = link.text().trim();
+    if ((title.startsWith("«") && title.endsWith("»")) || (title.startsWith('"') && title.endsWith('"'))) {
+      title = title.slice(1, -1).trim();
+    }
+
+    let description = $(el).find(".b-serp-item__text").text().trim();
+    // Yandex site search snippet often dumps sidebar categories instead of channel description
+    if (/бизнес и стартапы\.\s*знаменитости/i.test(description) || /категории|все каналы/i.test(description)) {
+      description = "";
+    }
+
+    results.push({ title, detailUrl: href, source: "tglib",
+      description, extractionStatus: "pending",
       chatType: href.includes("/groups/") ? "group" : "channel" });
   });
   if (!results.length && !/ничего не найдено|ничего не нашли|no results/i.test($.text())) throw new Error("TGLib search unavailable: no recognized Yandex site-search results");
@@ -86,9 +98,32 @@ export function parseTglibSearch(body: string, page: number) {
   return { results, hasMore };
 }
 
-export function extractTglibLink(body: string) {
+export function extractTglibDetails(body: string): { telegramUrl: string | null; title?: string; description?: string; imageUrl?: string | null } {
   const $ = cheerio.load(body);
-  return normalizeTelegramLink($("a.button.is-success").filter((_, a) => /Посмотреть|View|Open/i.test($(a).text())).first().attr("href"));
+  const telegramUrl = normalizeTelegramLink($("a.button.is-success").filter((_, a) => /Посмотреть|View|Open/i.test($(a).text())).first().attr("href"));
+
+  let title = $("h1").first().text().trim();
+  if (title) {
+    title = title.replace(/\s*—\s*официальный\s+Телеграм-канал.*$/i, "").trim();
+    if ((title.startsWith("«") && title.endsWith("»")) || (title.startsWith('"') && title.endsWith('"'))) {
+      title = title.slice(1, -1).trim();
+    }
+  }
+
+  const description = $(".content p, .channel-description, .description").first().text().trim();
+  let imageUrl = $("img.avatar, .channel-avatar img, .image img, .media-left img").attr("src") || null;
+  if (imageUrl && (imageUrl.includes("logo.png") || imageUrl.includes("default"))) {
+    imageUrl = null;
+  }
+  if (imageUrl && !imageUrl.startsWith("http")) {
+    imageUrl = `https://tglib.net${imageUrl.startsWith("/") ? "" : "/"}${imageUrl}`;
+  }
+
+  return { telegramUrl, title: title || undefined, description: description || undefined, imageUrl };
+}
+
+export function extractTglibLink(body: string) {
+  return extractTglibDetails(body).telegramUrl;
 }
 
 export async function fetchCatalogPage(source: string, query: string, page: number): Promise<{ results: StoredChannelInput[]; hasMore: boolean }> {
@@ -113,6 +148,9 @@ export async function fetchCatalogPage(source: string, query: string, page: numb
         const target = await request(redirect);
         item.telegramUrl = target.telegramUrl || null;
         item.extractionStatus = item.telegramUrl ? "success" : "pending";
+        if (item.telegramUrl && !item.telegramUrl.includes("+")) {
+          item.username = item.telegramUrl.split("/").pop() || null;
+        }
         if (!item.telegramUrl) logSearch(`[Warning] ${item.title}: redirect did not expose a Telegram link`);
       } catch (error: any) { checkSearchCancelled(); item.error = error.message; logSearch(`[Warning] ${item.title}: ${error.message}`); }
     }
@@ -124,8 +162,15 @@ export async function fetchCatalogPage(source: string, query: string, page: numb
     for (const item of parsed.results) {
       checkSearchCancelled();
       try {
-        item.telegramUrl = extractTglibLink((await request(item.detailUrl)).body);
+        const details = extractTglibDetails((await request(item.detailUrl)).body);
+        item.telegramUrl = details.telegramUrl;
+        if (details.title) item.title = details.title;
+        if (details.description) item.description = details.description;
+        if (details.imageUrl) item.imageUrl = details.imageUrl;
         item.extractionStatus = item.telegramUrl ? "success" : "pending";
+        if (item.telegramUrl && !item.telegramUrl.includes("+")) {
+          item.username = item.telegramUrl.split("/").pop() || null;
+        }
         if (!item.telegramUrl) logSearch(`[Warning] ${item.title}: no community link on detail page`);
       } catch (error: any) { checkSearchCancelled(); item.error = error.message; logSearch(`[Warning] ${item.title}: ${error.message}`); }
     }

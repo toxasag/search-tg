@@ -188,6 +188,27 @@ export function completeSearch(searchId: number, userId: number, searchStats: un
   db.prepare(`UPDATE searches SET status = ?, progress = CASE WHEN ? = 'completed' THEN 100 ELSE progress END, search_stats = ?, logs = ?, error = ?, completed_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?`).run(status, status, JSON.stringify(searchStats), JSON.stringify(logs), error, searchId, userId);
 }
 
+export function isBotTarget(
+  url?: string | null,
+  username?: string | null,
+  title?: string | null,
+  chatType?: string | null
+): boolean {
+  if (chatType === "bot") return true;
+
+  const cleanUser = (username || "").toLowerCase().trim().replace(/^@/, "");
+  if (cleanUser.endsWith("bot") && cleanUser.length >= 4) return true;
+
+  const cleanUrl = (url || "").toLowerCase().trim();
+  if (/(?:t\.me|telegram\.me)\/[a-z0-9_]{3,32}bot(?:$|\?|\/)/i.test(cleanUrl)) return true;
+  if (cleanUrl.endsWith("_bot")) return true;
+
+  const cleanTitle = (title || "").toLowerCase().trim();
+  if (/^(?:telegram:\s*)?(?:contact\s+@|start\s+@)[a-z0-9_]{3,32}bot$/i.test(cleanTitle)) return true;
+
+  return false;
+}
+
 export function saveResults(searchId: number, items: StoredChannelInput[]) {
   const upsert = db.prepare(`
     INSERT INTO search_results (
@@ -218,6 +239,10 @@ export function saveResults(searchId: number, items: StoredChannelInput[]) {
 
   db.transaction((records: StoredChannelInput[]) => {
     for (const rawItem of records) {
+      if (isBotTarget(rawItem.telegramUrl || rawItem.detailUrl, rawItem.username, rawItem.title, rawItem.chatType)) {
+        continue;
+      }
+
       const key = resultKey(rawItem);
       const cached = getCachedChannel(key);
       const item = cached ? {
@@ -233,6 +258,10 @@ export function saveResults(searchId: number, items: StoredChannelInput[]) {
         extractionStatus: cached.extractionStatus === "success" ? "success" : rawItem.extractionStatus,
         chatType: cached.chatType !== "unknown" ? cached.chatType : rawItem.chatType,
       } : rawItem;
+
+      if (isBotTarget(item.telegramUrl || item.detailUrl, item.username, item.title, item.chatType)) {
+        continue;
+      }
 
       // If the channel was previously enriched or cached and its true content is not relevant to the query, skip it.
       // Never filter imported channels by search query relevance!

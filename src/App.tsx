@@ -2,7 +2,8 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from "react"
 import { 
   Search, Globe, Database, Cpu, Settings, Play, ArrowDownToLine, 
   RefreshCw, CheckCircle, XCircle, AlertCircle, Copy, Check, 
-  ExternalLink, Trash2, ListFilter, HelpCircle, Info, ChevronRight,
+  ExternalLink, Trash2, ListFilter, HelpCircle, Info, ChevronRight, ChevronLeft,
+  ChevronsLeft, ChevronsRight, X, Download,
   Eye, FileSpreadsheet, FileJson, FileText, Layers, MessageSquare, Lock, Hash, Users, BookOpen, LogOut, ShieldCheck,
   Loader2, Sparkles
 } from "lucide-react";
@@ -40,13 +41,673 @@ function getAvatarBgColor(title: string): string {
   return colors[idx];
 }
 
+function GlobalDatabaseView() {
+  const [data, setData] = useState<{
+    channels: ScrapedChannel[];
+    totalCount: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+    stats: { total: number; channels: number; groups: number; closed: number; unknown: number };
+  }>({
+    channels: [],
+    totalCount: 0,
+    page: 1,
+    pageSize: 50,
+    totalPages: 1,
+    stats: { total: 0, channels: 0, groups: 0, closed: 0, unknown: 0 }
+  });
+
+  const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchField, setSearchField] = useState<"all" | "title" | "description">("all");
+  const [chatType, setChatType] = useState<string>("all");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [enrichStatus, setEnrichStatus] = useState<any>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(
+        `/api/database/channels?page=${page}&pageSize=${pageSize}&query=${encodeURIComponent(searchQuery)}&searchField=${searchField}&chatType=${chatType}`
+      );
+      if (res.ok) {
+        const json = await res.json();
+        setData(json);
+      }
+    } catch (e) {
+      console.error("Failed to fetch database channels:", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fetchData();
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [page, pageSize, searchQuery, searchField, chatType]);
+
+  // Reset page to 1 when filters change
+  const handleQueryChange = (val: string) => {
+    setSearchQuery(val);
+    setPage(1);
+  };
+
+  const handleFieldChange = (val: "all" | "title" | "description") => {
+    setSearchField(val);
+    setPage(1);
+  };
+
+  const handleTypeChange = (val: string) => {
+    setChatType(val);
+    setPage(1);
+  };
+
+  const handlePageSizeChange = (val: number) => {
+    setPageSize(val);
+    setPage(1);
+  };
+
+  // Poll enrichment status
+  useEffect(() => {
+    let timer: any = null;
+    const checkStatus = async () => {
+      try {
+        const res = await fetch("/api/database/enrich/status");
+        if (res.ok) {
+          const json = await res.json();
+          setEnrichStatus(json);
+          if (json.running) {
+            timer = setTimeout(checkStatus, 2000);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+    checkStatus();
+    return () => clearTimeout(timer);
+  }, []);
+
+  const startEnrichment = async () => {
+    try {
+      const res = await fetch("/api/database/enrich", { method: "POST" });
+      if (res.ok) {
+        const json = await res.json();
+        setEnrichStatus(json);
+      }
+    } catch (e) {
+      console.error("Enrichment start error:", e);
+    }
+  };
+
+  const toggleSelect = (id: string) => {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedIds(next);
+  };
+
+  const toggleSelectAllPage = () => {
+    if (data.channels.length === 0) return;
+    const allSelected = data.channels.every(c => selectedIds.has(c.id));
+    const next = new Set(selectedIds);
+    if (allSelected) {
+      data.channels.forEach(c => next.delete(c.id));
+    } else {
+      data.channels.forEach(c => next.add(c.id));
+    }
+    setSelectedIds(next);
+  };
+
+  const copyChannelLink = (url: string, id: string) => {
+    if (!url) return;
+    navigator.clipboard.writeText(url);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 1800);
+  };
+
+  const handleExport = async (format: "txt" | "txt_report" | "csv" | "json") => {
+    setIsExporting(true);
+    try {
+      const body: any = {
+        format,
+        query: searchQuery,
+        searchField,
+        chatType
+      };
+      if (selectedIds.size > 0) {
+        body.ids = Array.from(selectedIds);
+      }
+
+      const res = await fetch("/api/database/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      if (!res.ok) throw new Error("Export failed");
+
+      const blob = await res.blob();
+      const contentDisposition = res.headers.get("content-disposition");
+      let filename = `telegram_export_${new Date().toISOString().split("T")[0]}.${format === "csv" ? "csv" : format === "json" ? "json" : "txt"}`;
+      if (contentDisposition && contentDisposition.includes("filename=")) {
+        const match = contentDisposition.match(/filename="?([^"]+)"?/);
+        if (match?.[1]) filename = match[1];
+      }
+
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(blobUrl);
+    } catch (e) {
+      console.error(e);
+      alert("Ошибка при экспорте данных.");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const isAllPageSelected = data.channels.length > 0 && data.channels.every(c => selectedIds.has(c.id));
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0 space-y-4">
+      {/* Top Banner / Actions */}
+      <div className="bg-[#15181E] border border-slate-800 rounded-lg p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 shrink-0 shadow-sm">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-purple-600 to-indigo-700 flex items-center justify-center text-white shadow-[0_0_15px_rgba(147,51,234,0.3)]">
+            <Database className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-bold text-white tracking-tight">Глобальная база Telegram</h2>
+              <span className="bg-purple-950/70 border border-purple-500/30 text-purple-300 font-mono text-[11px] font-semibold px-2 py-0.5 rounded-full">
+                {data.stats.total.toLocaleString()} записей
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Единый реестр проверенных каналов, чатов и групп с поиском, ручной проверкой и выгрузкой
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2.5">
+          <a
+            href="/#database"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white rounded text-xs font-semibold transition-colors"
+            title="Открыть базу в новой вкладке"
+          >
+            <ExternalLink className="w-3.5 h-3.5" />
+            <span>В новой вкладке</span>
+          </a>
+
+          <button
+            onClick={startEnrichment}
+            disabled={enrichStatus?.running}
+            className={`flex items-center gap-2 px-3.5 py-1.5 rounded text-xs font-semibold transition-all shadow-[0_0_12px_rgba(37,99,235,0.2)] ${
+              enrichStatus?.running
+                ? "bg-blue-600/40 text-blue-200 cursor-not-allowed border border-blue-500/30"
+                : "bg-blue-600 hover:bg-blue-500 text-white"
+            }`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${enrichStatus?.running ? "animate-spin" : ""}`} />
+            <span>{enrichStatus?.running ? "Идет обогащение..." : "Проверить типы (обогатить)"}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Live Enrichment Progress Bar (if active) */}
+      {enrichStatus?.running && (
+        <div className="bg-blue-950/40 border border-blue-500/30 rounded-lg p-3 flex flex-col gap-2 shrink-0 animate-in fade-in">
+          <div className="flex items-center justify-between text-xs text-blue-300 font-mono">
+            <span className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping" />
+              <span>Фоновое обогащение базы данных...</span>
+            </span>
+            <span>
+              {enrichStatus.processed} / {enrichStatus.total} ({enrichStatus.total > 0 ? Math.round((enrichStatus.processed / enrichStatus.total) * 100) : 0}%)
+            </span>
+          </div>
+          <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+            <div
+              className="bg-blue-500 h-full rounded-full transition-all duration-300"
+              style={{ width: `${enrichStatus.total > 0 ? (enrichStatus.processed / enrichStatus.total) * 100 : 0}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
+            <span>Обновлено: <strong className="text-green-400">{enrichStatus.enriched}</strong></span>
+            <span>Ошибок/Пропущено: <strong className="text-amber-400">{enrichStatus.failed}</strong></span>
+          </div>
+        </div>
+      )}
+
+      {/* Type Filter Tabs */}
+      <div className="flex items-center gap-1.5 overflow-x-auto pb-1 shrink-0 scrollbar-thin">
+        {[
+          { key: "all", label: "Все", count: data.stats.total },
+          { key: "channel", label: "Каналы", count: data.stats.channels },
+          { key: "group", label: "Группы / Чаты", count: data.stats.groups },
+          { key: "closed", label: "Приватные ссылки", count: data.stats.closed },
+          { key: "unknown", label: "Неизвестно", count: data.stats.unknown },
+        ].map(tab => (
+          <button
+            key={tab.key}
+            onClick={() => handleTypeChange(tab.key)}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${
+              chatType === tab.key
+                ? "bg-blue-600 text-white shadow-sm"
+                : "bg-[#15181E] border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700"
+            }`}
+          >
+            <span>{tab.label}</span>
+            <span
+              className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono ${
+                chatType === tab.key ? "bg-blue-800 text-blue-100" : "bg-slate-800 text-slate-400"
+              }`}
+            >
+              {tab.count.toLocaleString()}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {/* Search and Filters Controls */}
+      <div className="bg-[#15181E] border border-slate-800 rounded-lg p-3 flex flex-col md:flex-row items-stretch md:items-center gap-3 shrink-0">
+        <div className="relative flex-1">
+          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => handleQueryChange(e.target.value)}
+            placeholder="Поиск по базе (по ключевым словам: тайланд, крипта, бизнес, ремонт)..."
+            className="w-full bg-[#0F1117] border border-slate-700 rounded-lg pl-9 pr-8 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => handleQueryChange("")}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 bg-[#0F1117] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-300">
+            <span className="text-slate-500 whitespace-nowrap">Где:</span>
+            <select
+              value={searchField}
+              onChange={(e) => handleFieldChange(e.target.value as any)}
+              className="bg-transparent text-white font-medium focus:outline-none cursor-pointer"
+            >
+              <option value="all" className="bg-slate-900 text-white">Везде (название + описание + @)</option>
+              <option value="title" className="bg-slate-900 text-white">Только в названии и @</option>
+              <option value="description" className="bg-slate-900 text-white">Только в описании</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-1.5 bg-[#0F1117] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-300">
+            <span className="text-slate-500 whitespace-nowrap">Показывать:</span>
+            <select
+              value={pageSize}
+              onChange={(e) => handlePageSizeChange(Number(e.target.value))}
+              className="bg-transparent text-white font-medium focus:outline-none cursor-pointer"
+            >
+              <option value={50} className="bg-slate-900 text-white">50 / стр</option>
+              <option value={100} className="bg-slate-900 text-white">100 / стр</option>
+              <option value={200} className="bg-slate-900 text-white">200 / стр</option>
+              <option value={500} className="bg-slate-900 text-white">500 / стр</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Bulk Operations Toolbar */}
+      <div className="bg-[#15181E] border border-slate-800 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={toggleSelectAllPage}
+            className="flex items-center gap-2 text-xs font-semibold text-slate-300 hover:text-white"
+          >
+            <input
+              type="checkbox"
+              checked={isAllPageSelected}
+              onChange={toggleSelectAllPage}
+              className="w-4 h-4 accent-blue-600 rounded cursor-pointer"
+            />
+            <span>{isAllPageSelected ? "Снять выбор со страницы" : "Выбрать все на странице"}</span>
+          </button>
+
+          <span className="text-xs text-slate-400 border-l border-slate-800 pl-3">
+            Выбрано: <strong className="text-blue-400 font-mono">{selectedIds.size}</strong>{" "}
+            {selectedIds.size === 0 && <span className="text-slate-500">(для выгрузки всего списка используйте кнопки справа)</span>}
+          </span>
+          {selectedIds.size > 0 && (
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="text-xs text-rose-400 hover:text-rose-300 underline font-medium"
+            >
+              Сбросить
+            </button>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-slate-500 mr-1 hidden sm:inline">Экспорт:</span>
+          <button
+            onClick={() => handleExport("txt")}
+            disabled={isExporting}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[#0F1117] hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
+            title="Выгрузить прямые ссылки в TXT"
+          >
+            <FileText className="w-3.5 h-3.5 text-blue-400" />
+            <span>TXT ссылки</span>
+          </button>
+
+          <button
+            onClick={() => handleExport("txt_report")}
+            disabled={isExporting}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[#0F1117] hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
+            title="Выгрузить подробный отчет с описаниями в TXT"
+          >
+            <FileText className="w-3.5 h-3.5 text-indigo-400" />
+            <span>TXT отчёт</span>
+          </button>
+
+          <button
+            onClick={() => handleExport("csv")}
+            disabled={isExporting}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[#0F1117] hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
+            title="Выгрузить в таблицу CSV (для Excel)"
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+            <span>CSV Excel</span>
+          </button>
+
+          <button
+            onClick={() => handleExport("json")}
+            disabled={isExporting}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[#0F1117] hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
+            title="Выгрузить в JSON"
+          >
+            <FileJson className="w-3.5 h-3.5 text-amber-400" />
+            <span>JSON</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Main Table Container */}
+      <div className="flex-1 overflow-auto min-h-0 bg-[#0F1117] border border-slate-800 rounded-lg shadow-inner">
+        {loading ? (
+          <div className="flex flex-col items-center justify-center h-64 gap-3">
+            <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+            <p className="text-xs text-slate-400 font-mono">Загрузка данных из реестра...</p>
+          </div>
+        ) : data.channels.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-64 gap-2 text-slate-500">
+            <Database className="w-10 h-10 text-slate-600 stroke-[1.5]" />
+            <p className="text-sm font-semibold text-slate-400">Ничего не найдено</p>
+            <p className="text-xs text-slate-500">Попробуйте изменить поисковый запрос или фильтр типа</p>
+          </div>
+        ) : (
+          <table className="w-full text-left border-collapse">
+            <thead className="bg-[#15181E] border-b border-slate-800 sticky top-0 z-10 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+              <tr>
+                <th className="p-3 w-10 text-center">
+                  <input
+                    type="checkbox"
+                    checked={isAllPageSelected}
+                    onChange={toggleSelectAllPage}
+                    className="w-4 h-4 accent-blue-600 rounded cursor-pointer"
+                  />
+                </th>
+                <th className="p-3">Канал / Чат</th>
+                <th className="p-3 hidden md:table-cell">Описание</th>
+                <th className="p-3 whitespace-nowrap">Аудитория</th>
+                <th className="p-3 whitespace-nowrap">Тип</th>
+                <th className="p-3 text-right">Действия</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/40 text-xs">
+              {data.channels.map((channel) => {
+                const isSelected = selectedIds.has(channel.id);
+                return (
+                  <tr
+                    key={channel.id}
+                    className={`hover:bg-slate-800/30 transition-colors ${
+                      isSelected ? "bg-blue-950/20" : ""
+                    }`}
+                  >
+                    <td className="p-3 text-center">
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => toggleSelect(channel.id)}
+                        className="w-4 h-4 accent-blue-600 rounded cursor-pointer"
+                      />
+                    </td>
+
+                    {/* Channel / Chat Avatar & Details */}
+                    <td className="p-3">
+                      <div className="flex items-center gap-3 max-w-[280px]">
+                        {channel.imageUrl ? (
+                          <img
+                            src={channel.imageUrl}
+                            alt=""
+                            className="w-10 h-10 rounded-full object-cover shrink-0 border border-slate-700/50 shadow-sm"
+                            loading="lazy"
+                            onError={(e) => {
+                              (e.target as HTMLElement).style.display = "none";
+                            }}
+                          />
+                        ) : (
+                          <div
+                            className={`w-10 h-10 rounded-full flex items-center justify-center text-xs font-bold shrink-0 shadow-inner ${getAvatarBgColor(
+                              channel.title
+                            )}`}
+                          >
+                            {getCleanMonogram(channel.title)}
+                          </div>
+                        )}
+
+                        <div className="min-w-0">
+                          <div
+                            className="font-semibold text-white truncate text-xs"
+                            title={channel.title}
+                          >
+                            {channel.title || "Без названия"}
+                          </div>
+                          {channel.telegramUrl ? (
+                            <a
+                              href={channel.telegramUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-400 hover:text-blue-300 text-[11px] truncate flex items-center gap-1 mt-0.5"
+                            >
+                              <span>
+                                {channel.username ? `@${channel.username}` : channel.telegramUrl.replace("https://t.me/", "")}
+                              </span>
+                              <ExternalLink className="w-2.5 h-2.5 shrink-0 opacity-70" />
+                            </a>
+                          ) : (
+                            <span className="text-[11px] text-slate-500">Нет ссылки</span>
+                          )}
+                        </div>
+                      </div>
+                    </td>
+
+                    {/* Description */}
+                    <td className="p-3 hidden md:table-cell max-w-md">
+                      <div
+                        className="text-slate-400 text-xs line-clamp-2 leading-relaxed"
+                        title={channel.description}
+                      >
+                        {channel.description || (
+                          <span className="text-slate-600 italic">Описание отсутствует</span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Audience / Subscribers */}
+                    <td className="p-3 whitespace-nowrap">
+                      <div className="flex items-center gap-1.5 font-mono text-slate-300">
+                        <Users className="w-3.5 h-3.5 text-slate-500" />
+                        <span>{channel.subscribers || "—"}</span>
+                      </div>
+                    </td>
+
+                    {/* Chat Type Badge */}
+                    <td className="p-3 whitespace-nowrap">
+                      <span
+                        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                          channel.chatType === "channel"
+                            ? "bg-indigo-500/15 text-indigo-300 border border-indigo-500/30"
+                            : channel.chatType === "group"
+                            ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                            : channel.chatType === "closed"
+                            ? "bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                            : channel.chatType === "bot"
+                            ? "bg-purple-500/15 text-purple-300 border border-purple-500/30"
+                            : channel.chatType === "contact"
+                            ? "bg-cyan-500/15 text-cyan-300 border border-cyan-500/30"
+                            : "bg-slate-800 text-slate-400 border border-slate-700"
+                        }`}
+                      >
+                        {channel.chatType === "channel"
+                          ? "Канал"
+                          : channel.chatType === "group"
+                          ? "Группа / Чат"
+                          : channel.chatType === "closed"
+                          ? "Приватный"
+                          : channel.chatType === "bot"
+                          ? "Бот"
+                          : channel.chatType === "contact"
+                          ? "Контакт"
+                          : "Неизвестно"}
+                      </span>
+                    </td>
+
+                    {/* Action buttons */}
+                    <td className="p-3 text-right whitespace-nowrap">
+                      {channel.telegramUrl && (
+                        <div className="inline-flex items-center gap-1.5">
+                          <button
+                            onClick={() => copyChannelLink(channel.telegramUrl!, channel.id)}
+                            className="p-1.5 rounded hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
+                            title="Копировать ссылку в буфер"
+                          >
+                            {copiedId === channel.id ? (
+                              <Check className="w-3.5 h-3.5 text-green-400" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                          <a
+                            href={channel.telegramUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="p-1.5 rounded hover:bg-slate-800 text-slate-400 hover:text-blue-400 transition-colors"
+                            title="Открыть в Telegram"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Pagination Footer */}
+      <div className="bg-[#15181E] border border-slate-800 rounded-lg p-3 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs shrink-0">
+        <div className="text-slate-400">
+          Показано{" "}
+          <strong className="text-white font-mono">
+            {data.totalCount > 0 ? (page - 1) * pageSize + 1 : 0}
+          </strong>{" "}
+          -{" "}
+          <strong className="text-white font-mono">
+            {Math.min(page * pageSize, data.totalCount)}
+          </strong>{" "}
+          из <strong className="text-white font-mono">{data.totalCount.toLocaleString()}</strong> записей
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <button
+            disabled={page <= 1}
+            onClick={() => setPage(1)}
+            className="p-1.5 rounded bg-[#0F1117] border border-slate-700 text-slate-300 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+            title="Первая страница"
+          >
+            <ChevronsLeft className="w-4 h-4" />
+          </button>
+          <button
+            disabled={page <= 1}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-[#0F1117] border border-slate-700 text-slate-300 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+          >
+            <ChevronLeft className="w-4 h-4" />
+            <span>Назад</span>
+          </button>
+
+          <span className="px-3 py-1 font-mono text-slate-300 bg-slate-900 border border-slate-800 rounded">
+            Стр {page} из {data.totalPages || 1}
+          </span>
+
+          <button
+            disabled={page >= data.totalPages}
+            onClick={() => setPage((p) => Math.min(data.totalPages, p + 1))}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-[#0F1117] border border-slate-700 text-slate-300 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+          >
+            <span>Вперед</span>
+            <ChevronRight className="w-4 h-4" />
+          </button>
+          <button
+            disabled={page >= data.totalPages}
+            onClick={() => setPage(data.totalPages)}
+            className="p-1.5 rounded bg-[#0F1117] border border-slate-700 text-slate-300 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+            title="Последняя страница"
+          >
+            <ChevronsRight className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [viewMode, setViewMode] = useState<"dashboard" | "database">(window.location.hash === "#database" ? "database" : "dashboard");
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [needsBootstrap, setNeedsBootstrap] = useState(false);
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
   const [activeSearchStatus, setActiveSearchStatus] = useState<any | null>(null);
   const [isOwnerPanelOpen, setIsOwnerPanelOpen] = useState(false);
+
+  useEffect(() => {
+    const handleHash = () => {
+      setViewMode(window.location.hash === "#database" ? "database" : "dashboard");
+    };
+    window.addEventListener("hashchange", handleHash);
+    return () => window.removeEventListener("hashchange", handleHash);
+  }, []);
 
   // Scraper State
   const [query, setQuery] = useState("");
@@ -615,6 +1276,26 @@ export default function App() {
             </div>
           </div>
           <div className="lg:hidden flex items-center gap-2">
+            <button
+              onClick={() => {
+                const nextMode = viewMode === "dashboard" ? "database" : "dashboard";
+                setViewMode(nextMode);
+                window.location.hash = nextMode === "database" ? "#database" : "";
+              }}
+              className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white flex items-center gap-1.5 transition-colors border border-slate-700"
+            >
+              {viewMode === "dashboard" ? (
+                <>
+                  <Database className="w-3.5 h-3.5 text-purple-400" />
+                  <span>База</span>
+                </>
+              ) : (
+                <>
+                  <Layers className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Поиск</span>
+                </>
+              )}
+            </button>
             <div className="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_8px_#22c55e]"></div>
             <span className="text-[10px] font-mono text-slate-400">Active</span>
           </div>
@@ -622,11 +1303,40 @@ export default function App() {
 
         <nav className="hidden lg:flex flex-1 flex-col px-4 py-4 space-y-4 overflow-y-auto">
           <div>
-            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2 pb-2">Operations</div>
+            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2 pb-2">Разделы</div>
             <div className="space-y-1">
-              <a href="#" className="flex items-center gap-3 px-3 py-2 bg-slate-800 text-white rounded text-xs font-semibold">
-                <Layers className="w-4 h-4 text-blue-500" />
-                <span>Dashboard Feed</span>
+              <a
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  setViewMode("dashboard");
+                  window.location.hash = "";
+                }}
+                className={`flex items-center gap-3 px-3 py-2 rounded text-xs font-semibold transition-colors ${
+                  viewMode === "dashboard" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white hover:bg-slate-800/50"
+                }`}
+              >
+                <Layers className={`w-4 h-4 ${viewMode === "dashboard" ? "text-blue-500" : "text-slate-500"}`} />
+                <span>Поиск и парсинг</span>
+              </a>
+              <a
+                href="#database"
+                onClick={(e) => {
+                  e.preventDefault();
+                  setViewMode("database");
+                  window.location.hash = "#database";
+                }}
+                className={`flex items-center justify-between px-3 py-2 rounded text-xs font-semibold transition-colors ${
+                  viewMode === "database" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white hover:bg-slate-800/50"
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Database className={`w-4 h-4 ${viewMode === "database" ? "text-purple-500" : "text-slate-500"}`} />
+                  <span>Глобальная база</span>
+                </div>
+                <div className="bg-slate-900 text-[10px] px-1.5 py-0.5 rounded text-slate-300 font-mono">
+                  {counters.total > 0 ? (counters.total >= 1000 ? (counters.total / 1000).toFixed(1) + "k" : counters.total) : "..."}
+                </div>
               </a>
             </div>
           </div>
@@ -713,6 +1423,11 @@ export default function App() {
       <main className="flex-1 flex flex-col overflow-hidden">
         <Header apiKeyMissing={apiKeyMissing} />
 
+        {viewMode === "database" ? (
+          <div className="flex-1 p-4 md:p-6 flex flex-col min-h-0 overflow-hidden">
+            <GlobalDatabaseView />
+          </div>
+        ) : (
         <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6">
           <ChangePasswordPanel required={currentUser.mustChangePassword} onChanged={handlePasswordChanged} />
           {activeSearchStatus && ["queued", "running", "cancelling"].includes(activeSearchStatus.status) && (
@@ -1576,6 +2291,7 @@ export default function App() {
           />
 
         </div>
+        )}
 
         {/* Footer block matching Geometric Balance */}
         <footer className="h-12 border-t border-slate-800 bg-[#0F1117] px-8 flex items-center justify-between text-[10px] text-slate-500 font-mono flex-shrink-0">

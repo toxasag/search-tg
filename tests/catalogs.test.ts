@@ -51,3 +51,22 @@ test("Catalog redirect resolves tg:// without fetching Telegram or arbitrary hos
     await assert.rejects(fetchCatalogPage("tglib", "test", 1), /CAPTCHA/);
   } finally { globalThis.fetch = original; }
 });
+
+test("isBotTarget detects bot links and usernames while preserving regular channels and groups", async () => {
+  const { isBotTarget } = await import("../server/store.js");
+  assert.equal(isBotTarget("https://t.me/beelinebusiness_bot"), true);
+  assert.equal(isBotTarget("https://t.me/chat4bizbot"), true);
+  assert.equal(isBotTarget("https://t.me/my_test_bot"), true);
+  assert.equal(isBotTarget(null, "some_support_bot"), true);
+  assert.equal(isBotTarget(null, "chatgptbot"), true);
+  assert.equal(isBotTarget(null, null, "Telegram: Contact @sample_bot"), true);
+  assert.equal(isBotTarget(null, null, null, "bot"), true);
+
+  // Legitimate channels & groups must NOT be classified as bots
+  assert.equal(isBotTarget("https://t.me/phuketchatru"), false);
+  assert.equal(isBotTarget("https://t.me/robotics_daily"), false);
+  assert.equal(isBotTarget("https://t.me/+joinchat_hash"), false);
+  assert.equal(isBotTarget("https://t.me/bottles_business"), false);
+  assert.equal(isBotTarget(null, "bottom_line"), false);
+});
+
