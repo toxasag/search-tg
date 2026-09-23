@@ -137,8 +137,10 @@ export function recoverStaleSearches() {
 }
 
 
+const getCachedChannelStmt = db.prepare("SELECT * FROM channels WHERE dedup_key=?");
+
 export function getCachedChannel(dedupKey: string) {
-  const row = db.prepare("SELECT * FROM channels WHERE dedup_key=?").get(dedupKey) as any;
+  const row = getCachedChannelStmt.get(dedupKey) as any;
   if (!row) return null;
   return {
     title: row.title, description: row.description, subscribers: row.subscribers, detailUrl: row.detail_url,
@@ -148,18 +150,21 @@ export function getCachedChannel(dedupKey: string) {
     similarChannels: row.similar_channels ? JSON.parse(row.similar_channels) : null,
   };
 }
+
+const putCachedChannelStmt = db.prepare(`INSERT INTO channels (dedup_key,title,description,subscribers,detail_url,image_url,source,telegram_url,username,channel_description,stats,extraction_status,chat_type,error,similar_channels)
+  VALUES (@dedupKey,@title,@description,@subscribers,@detailUrl,@imageUrl,@source,@telegramUrl,@username,@channelDescription,@stats,@extractionStatus,@chatType,@error,@similarChannels)
+  ON CONFLICT(dedup_key) DO UPDATE SET
+    title=CASE WHEN excluded.title LIKE '@%' THEN channels.title ELSE excluded.title END,
+    description=CASE WHEN excluded.description='' THEN channels.description ELSE excluded.description END,
+    subscribers=COALESCE(excluded.subscribers,channels.subscribers), image_url=COALESCE(excluded.image_url,channels.image_url),
+    source=excluded.source, telegram_url=COALESCE(excluded.telegram_url,channels.telegram_url), username=COALESCE(excluded.username,channels.username),
+    channel_description=COALESCE(excluded.channel_description,channels.channel_description), stats=COALESCE(excluded.stats,channels.stats),
+    extraction_status=CASE WHEN channels.extraction_status='success' THEN 'success' ELSE excluded.extraction_status END,
+    chat_type=CASE WHEN excluded.chat_type='unknown' THEN channels.chat_type ELSE excluded.chat_type END,
+    error=excluded.error, similar_channels=COALESCE(excluded.similar_channels,channels.similar_channels), updated_at=CURRENT_TIMESTAMP`);
+
 export function putCachedChannel(dedupKey: string, payload: any) {
-  db.prepare(`INSERT INTO channels (dedup_key,title,description,subscribers,detail_url,image_url,source,telegram_url,username,channel_description,stats,extraction_status,chat_type,error,similar_channels)
-    VALUES (@dedupKey,@title,@description,@subscribers,@detailUrl,@imageUrl,@source,@telegramUrl,@username,@channelDescription,@stats,@extractionStatus,@chatType,@error,@similarChannels)
-    ON CONFLICT(dedup_key) DO UPDATE SET
-      title=CASE WHEN excluded.title LIKE '@%' THEN channels.title ELSE excluded.title END,
-      description=CASE WHEN excluded.description='' THEN channels.description ELSE excluded.description END,
-      subscribers=COALESCE(excluded.subscribers,channels.subscribers), image_url=COALESCE(excluded.image_url,channels.image_url),
-      source=excluded.source, telegram_url=COALESCE(excluded.telegram_url,channels.telegram_url), username=COALESCE(excluded.username,channels.username),
-      channel_description=COALESCE(excluded.channel_description,channels.channel_description), stats=COALESCE(excluded.stats,channels.stats),
-      extraction_status=CASE WHEN channels.extraction_status='success' THEN 'success' ELSE excluded.extraction_status END,
-      chat_type=CASE WHEN excluded.chat_type='unknown' THEN channels.chat_type ELSE excluded.chat_type END,
-      error=excluded.error, similar_channels=COALESCE(excluded.similar_channels,channels.similar_channels), updated_at=CURRENT_TIMESTAMP`).run({
+  putCachedChannelStmt.run({
     dedupKey, title: payload.title, description: payload.description || '', subscribers: payload.subscribers || null,
     detailUrl: payload.detailUrl, imageUrl: payload.imageUrl || null, source: payload.source,
     telegramUrl: payload.telegramUrl || null, username: payload.username || null, channelDescription: payload.channelDescription || null,

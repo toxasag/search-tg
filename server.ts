@@ -41,18 +41,23 @@ import {
   saveResults,
   updateResult,
   searchCachedChannels,
+  resultKey,
 } from "./server/store.js";
+import { filterAndRankByRelevance, calculateRelevance } from "./server/relevance.js";
 
 dotenv.config();
 
-// Node's fetch (undici) does NOT read the OS-level system proxy that browsers use
-// automatically — a VPN configured system-wide (e.g. via `scutil --proxy` on macOS)
-// is invisible to it unless explicitly wired up here. Without this, sites reachable
-// in the browser can silently fail to connect (UND_ERR_CONNECT_TIMEOUT) from Node.
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
+const rawProxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
+const isLocalProxy = rawProxyUrl ? /(?:127\.0\.0\.1|localhost)/.test(rawProxyUrl) : false;
+const proxyUrl = (isLocalProxy && process.env.NODE_ENV === "production" && process.env.ALLOW_LOCAL_PROXY !== "true")
+  ? undefined
+  : rawProxyUrl;
+
 if (proxyUrl) {
   setGlobalDispatcher(new ProxyAgent(proxyUrl));
   console.log(`[Network] Routing outbound requests through proxy: ${proxyUrl}`);
+} else if (rawProxyUrl) {
+  console.log(`[Network] Ignoring local proxy in production: ${rawProxyUrl}`);
 }
 
 export const app = express();
@@ -62,7 +67,8 @@ const MAX_GLOBAL_CONCURRENT_SEARCHES = 2;
 const activeSearches = new Set<number>();
 let activeGlobalJobCount = 0;
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 app.use(attachSession);
 
@@ -687,7 +693,7 @@ function parseWithSelectors(html: string, source: string, baseUrl: string): any[
 const CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // Helper to make a fetch request with randomized mobile/desktop browser headers and automatic retry
-async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000, extraHeaders: Record<string, string> = {}, timeoutMs = 15000): Promise<string> {
+async function fetchWithHeaders(url: string, retries = 1, delayMs = 1000, extraHeaders: Record<string, string> = {}, timeoutMs = 7000): Promise<string> {
   const headers = {
     "User-Agent": CHROME_USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -708,7 +714,7 @@ async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000, extraH
 
   for (let attempt = 1; attempt <= retries + 1; attempt++) {
     try {
-      const response = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
       if (response.status === 429) {
         console.warn(`[Rate Limit] HTTP 429 for ${url}. Retrying after ${delayMs * 2}ms...`);
         if (attempt <= retries) {
@@ -721,14 +727,13 @@ async function fetchWithHeaders(url: string, retries = 2, delayMs = 1000, extraH
       }
       return await response.text();
     } catch (error: any) {
-      // error.message alone is often just "fetch failed" — undici puts the real
-      // reason (DNS failure, TLS error, ECONNREFUSED, timeout, ...) on error.cause.
       const causeDetail = error.cause ? ` — cause: ${error.cause.code || error.cause.message || error.cause}` : "";
+      const isFatal = /ECONNREFUSED|UND_ERR_CONNECT_TIMEOUT|TimeoutError|timeout/i.test(`${error.message} ${causeDetail}`);
       console.warn(`[Fetch Attempt ${attempt}/${retries + 1}] Failed for ${url}: ${error.message}${causeDetail}`);
-      if (attempt <= retries) {
+      if (!isFatal && attempt <= retries) {
         await new Promise(r => setTimeout(r, delayMs * attempt));
       } else {
-        throw new Error(`Failed to fetch page content after ${retries + 1} attempts: ${error.message}${causeDetail}`);
+        throw new Error(`Failed to fetch page content: ${error.message}${causeDetail}`);
       }
     }
   }
@@ -833,9 +838,85 @@ app.post("/api/auth/change-password", requireUser, async (req: AuthenticatedRequ
   }
 });
 
+interface ImportWorkerState {
+  running: boolean;
+  searchId: number | null;
+  total: number;
+  processed: number;
+  enriched: number;
+  failed: number;
+  lastUpdated: string;
+}
+
+let importWorkerState: ImportWorkerState = {
+  running: false,
+  searchId: null,
+  total: 0,
+  processed: 0,
+  enriched: 0,
+  failed: 0,
+  lastUpdated: new Date().toISOString()
+};
+
+async function runBackgroundEnrichment(userId: number, searchId?: number) {
+  if (importWorkerState.running) return;
+  importWorkerState.running = true;
+
+  try {
+    const query = searchId
+      ? `SELECT r.id, r.telegram_url FROM search_results r WHERE r.search_id=? AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown')`
+      : `SELECT r.id, r.telegram_url FROM search_results r JOIN searches s ON s.id=r.search_id WHERE s.user_id=? AND r.source='import' AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown') LIMIT 3000`;
+    const params = searchId ? [searchId] : [userId];
+    const rows = db.prepare(query).all(...params) as { id: number; telegram_url: string }[];
+
+    importWorkerState.total = rows.length;
+    importWorkerState.processed = 0;
+    importWorkerState.enriched = 0;
+    importWorkerState.failed = 0;
+    importWorkerState.searchId = searchId || null;
+
+    const BATCH_SIZE = 5;
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const batch = rows.slice(i, i + BATCH_SIZE);
+      await Promise.all(batch.map(async (row) => {
+        try {
+          const url = normalizeTelegramLink(row.telegram_url);
+          if (!url) {
+            importWorkerState.processed++;
+            return;
+          }
+          const preview = await enrichTelegramPreview(url);
+          const existing = getResult(userId, row.id);
+          if (existing) {
+            updateResult(userId, row.id, {
+              title: preview.title,
+              description: preview.description,
+              imageUrl: preview.imageUrl,
+              subscribers: preview.subscribers,
+              chatType: preview.chatType,
+              telegramUrl: url,
+              username: url.includes('/+') ? null : url.split('/').pop() || null,
+              extractionStatus: preview.chatType === 'unknown' ? 'pending' : 'success'
+            });
+            importWorkerState.enriched++;
+          }
+        } catch {
+          importWorkerState.failed++;
+        } finally {
+          importWorkerState.processed++;
+          importWorkerState.lastUpdated = new Date().toISOString();
+        }
+      }));
+      await new Promise(r => setTimeout(r, 150));
+    }
+  } finally {
+    importWorkerState.running = false;
+  }
+}
+
 app.post("/api/import", requireUser, async (req: AuthenticatedRequest, res) => {
   const raw = typeof req.body?.links === "string" ? req.body.links : "";
-  const input = raw.split(/[\s,;\n]+/).filter(Boolean).slice(0, 5000);
+  const input = raw.split(/[\s,;\n]+/).filter(Boolean).slice(0, 50000);
   const valid = input.map(value => normalizeTelegramLink(value)).filter((value): value is string => typeof value === "string");
   const unique: string[] = Array.from(new Set(valid));
   if (!unique.length) return res.status(400).json({ error: "Не найдено валидных Telegram-ссылок." });
@@ -843,47 +924,63 @@ app.post("/api/import", requireUser, async (req: AuthenticatedRequest, res) => {
   const { getCachedChannel } = await import("./server/db.js");
   const imported: any[] = [];
   let fromBase = 0;
-  let enriched = 0;
   let alreadyStored = 0;
+
   for (const url of unique) {
     const key = `telegram:${url}`;
     const cached = getCachedChannel(key);
-    if (cached) { fromBase++; alreadyStored++; continue; }
-    const item: any = { title: url.replace("https://t.me/", "@"), description: "", detailUrl: url, source: "import", telegramUrl: url, username: url.split("/").pop() || null, extractionStatus: "pending", chatType: url.includes("+") ? "closed" : "unknown" };
-    try {
-      const preview = await enrichTelegramPreview(url);
-      Object.assign(item, preview);
-      item.telegramUrl = normalizeTelegramLink(url) || url;
-      item.username = item.telegramUrl.startsWith("https://t.me/") && !item.telegramUrl.includes("+") ? item.telegramUrl.split("/").pop() : null;
-      item.extractionStatus = preview.chatType === "unknown" ? "pending" : "success";
-      enriched++;
-    } catch (error: any) { item.error = error.message; }
+    if (cached) {
+      fromBase++;
+      alreadyStored++;
+      imported.push({
+        title: cached.title,
+        description: cached.description,
+        subscribers: cached.subscribers,
+        imageUrl: cached.imageUrl,
+        detailUrl: url,
+        source: "import",
+        telegramUrl: url,
+        username: cached.username || (url.includes("+") ? null : url.split("/").pop()),
+        extractionStatus: cached.extractionStatus,
+        chatType: cached.chatType
+      });
+      continue;
+    }
+    const item: any = {
+      title: url.replace("https://t.me/", "@"),
+      description: "",
+      detailUrl: url,
+      source: "import",
+      telegramUrl: url,
+      username: url.split("/").pop() || null,
+      extractionStatus: "pending",
+      chatType: url.includes("+") ? "closed" : "unknown"
+    };
     imported.push(item);
   }
-  if (!imported.length) return res.json({ id: null, inputCount: input.length, uniqueCount: unique.length, duplicateCount: input.length - unique.length, alreadyStored, fromBase, enriched, results: [] });
-  const searchId = createSearch(userId, { query: `Импорт ${imported.length} новых ссылок`, source: "import", mode: "fast", limitPages: 1, requestId: `import-${Date.now()}-${Math.random()}` });
+
+  if (!imported.length) return res.json({ id: null, inputCount: input.length, uniqueCount: unique.length, duplicateCount: input.length - unique.length, alreadyStored, fromBase, enriched: 0, results: [] });
+  const searchId = createSearch(userId, { query: `Импорт ${imported.length} ссылок`, source: "import", mode: "fast", limitPages: 1, requestId: `import-${Date.now()}-${Math.random()}` });
   saveResults(searchId, imported);
-  completeSearch(searchId, userId, { import: { pagesFetched: 1, totalFound: input.length, uniqueAdded: imported.length, duplicatesFiltered: input.length - unique.length + alreadyStored, fromBase, enriched } }, [`[Import] Получено строк: ${input.length}`, `[Import] Уникальных в файле: ${unique.length}`, `[Import] Дубликатов в файле: ${input.length - unique.length}`, `[Import] Уже в постоянной базе: ${alreadyStored}`, `[Import] Новых добавлено: ${imported.length}`, `[Import] Обогащено из Telegram preview: ${enriched}`]);
-  res.json({ id: String(searchId), inputCount: input.length, uniqueCount: unique.length, duplicateCount: input.length - unique.length, alreadyStored, fromBase, enriched, added: imported.length, results: imported });
+  completeSearch(searchId, userId, { import: { pagesFetched: 1, totalFound: input.length, uniqueAdded: imported.length, duplicatesFiltered: input.length - unique.length, fromBase, enriched: fromBase } }, [`[Import] Получено строк: ${input.length}`, `[Import] Уникальных в файле: ${unique.length}`, `[Import] Из постоянной базы: ${fromBase}`, `[Import] Сохранено в базу: ${imported.length}`]);
+
+  // Launch background enrichment without blocking client response
+  void runBackgroundEnrichment(userId, searchId);
+
+  res.json({ id: String(searchId), inputCount: input.length, uniqueCount: unique.length, duplicateCount: input.length - unique.length, alreadyStored, fromBase, added: imported.length, results: imported });
 });
 
 app.post("/api/import/enrich", requireUser, async (req: AuthenticatedRequest, res) => {
   const userId = req.user!.id;
-  const rows = db.prepare(`SELECT r.id, r.telegram_url FROM search_results r JOIN searches s ON s.id=r.search_id WHERE s.user_id=? AND r.source='import' AND r.telegram_url IS NOT NULL AND (r.image_url IS NULL OR r.description='' OR r.chat_type='unknown') LIMIT 2000`).all(userId) as {id:number; telegram_url:string}[];
-  let updated = 0;
-  let failed = 0;
-  for (const row of rows) {
-    try {
-      const url = normalizeTelegramLink(row.telegram_url);
-      if (!url) continue;
-      const preview = await enrichTelegramPreview(url);
-      const existing = getResult(userId, row.id);
-      if (!existing) continue;
-      updateResult(userId, row.id, { title: preview.title, description: preview.description, imageUrl: preview.imageUrl, subscribers: preview.subscribers, chatType: preview.chatType, telegramUrl: url, username: url.includes('/+') ? null : url.split('/').pop() || null, extractionStatus: preview.chatType === 'unknown' ? 'pending' : 'success' });
-      updated++;
-    } catch { failed++; }
+  const searchId = typeof req.body?.searchId === "number" || typeof req.body?.searchId === "string" ? Number(req.body.searchId) : undefined;
+  if (!importWorkerState.running) {
+    void runBackgroundEnrichment(userId, Number.isInteger(searchId) ? searchId : undefined);
   }
-  res.json({ total: rows.length, updated, failed });
+  res.json({ status: "started", ...importWorkerState });
+});
+
+app.get("/api/import/enrich/status", requireUser, (_req, res) => {
+  res.json(importWorkerState);
 });
 
 app.get("/api/admin/searches", requireOwner, (_req, res) => {
@@ -969,14 +1066,38 @@ async function enrichTelegramPreview(url: string) {
   const response = await fetch(url, { headers: { "User-Agent": CHROME_USER_AGENT }, signal: AbortSignal.timeout(15000) });
   if (!response.ok) throw new Error(`Telegram preview HTTP ${response.status}`);
   const $ = cheerio.load(await response.text());
-  const title = $("meta[property='og:title']").attr("content") || $(".tgme_page_title").text().trim();
-  const description = $("meta[property='og:description']").attr("content") || $(".tgme_page_description").text().trim();
-  const imageUrl = $("meta[property='og:image']").attr("content") || $(".tgme_page_photo_image img").attr("src") || null;
+  
+  let title = $("meta[property='og:title']").attr("content") || $(".tgme_page_title").text().trim();
+  if (title.startsWith("Telegram: Contact @") || title.startsWith("Telegram: Join Group")) {
+    title = url.replace("https://t.me/", "@");
+  } else if (title.startsWith("Telegram: ")) {
+    title = title.replace(/^Telegram:\s*/, "").trim();
+  }
+
+  let description = $("meta[property='og:description']").attr("content") || $(".tgme_page_description").text().trim();
+  // Filter out Telegram's default placeholder texts
+  if (/right away\.$/i.test(description) || /If you have Telegram/i.test(description) || /You can view and join/i.test(description)) {
+    description = "";
+  }
+
+  let imageUrl = $("meta[property='og:image']").attr("content") || $(".tgme_page_photo_image img").attr("src") || null;
+  // If Telegram returns default placeholder logo, treat as null so UI shows styled initials
+  if (imageUrl && (imageUrl.includes("t_logo") || imageUrl.includes("telegram.org/img"))) {
+    imageUrl = null;
+  }
+
   const extra = $(".tgme_page_extra").text().trim();
   const subscribers = extra.match(/[\d.,KMB]+\s+(?:subscribers|members)/i)?.[0] || null;
   const lower = `${extra} ${$(".tgme_page_action").text()}`.toLowerCase();
   const chatType = /members|join group|chat/.test(lower) ? "group" : /subscribers|view channel/.test(lower) ? "channel" : url.includes("+") || url.includes("joinchat") ? "closed" : "unknown";
-  return { title: title || url.replace("https://t.me/", "@"), description: description || "", imageUrl, subscribers, chatType };
+
+  return {
+    title: title || url.replace("https://t.me/", "@"),
+    description: description || "",
+    imageUrl,
+    subscribers,
+    chatType
+  };
 }
 
 function getBaseUrlForSource(source: string): string {
@@ -993,6 +1114,45 @@ function getBaseUrlForSource(source: string): string {
       return "https://lyzem.com";
     default:
       return "";
+  }
+}
+
+async function enrichResultsBatch(userId: number, searchId: number, items: any[]) {
+  if (process.env.NODE_ENV === "test") return;
+  for (const item of items) {
+    if (!item.telegramUrl || item.imageUrl) continue;
+    try {
+      const url = normalizeTelegramLink(item.telegramUrl);
+      if (!url) continue;
+      const preview = await enrichTelegramPreview(url);
+      const existing = db.prepare("SELECT id FROM search_results WHERE search_id=? AND dedup_key=?").get(searchId, resultKey(item)) as { id?: number } | undefined;
+      if (existing?.id) {
+        // Verify live preview against the user query (skip for imported channels)
+        const searchRow = db.prepare("SELECT query, source FROM searches WHERE id=?").get(searchId) as { query: string; source: string } | undefined;
+        if (searchRow?.query && searchRow.source !== "import") {
+          const testItem = {
+            title: preview.title,
+            description: preview.description,
+            username: item.username,
+            subscribers: preview.subscribers,
+            chatType: preview.chatType
+          };
+          const rel = calculateRelevance(testItem, searchRow.query);
+          if (!rel.isRelevant) {
+            db.prepare("DELETE FROM search_results WHERE id=?").run(existing.id);
+            continue;
+          }
+        }
+
+        updateResult(userId, existing.id, {
+          title: preview.title,
+          description: preview.description,
+          imageUrl: preview.imageUrl,
+          subscribers: preview.subscribers,
+          chatType: preview.chatType
+        });
+      }
+    } catch {}
   }
 }
 
@@ -1017,7 +1177,7 @@ export async function runSearchJob(userId: number, searchId: number, input: { qu
 
   const sources: string[] = [];
   if (source === "all") {
-    sources.push("tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem", ...EXTRA_CATALOGS);
+    sources.push("lyzem", "tglib", "catalogTelegram", "tgcat", "tgsearch", "tgramcat", "tgramsearch", "waybien");
     if (telegramConfigured()) sources.push("telegram");
   } else {
     sources.push(source);
@@ -1027,6 +1187,32 @@ export async function runSearchJob(userId: number, searchId: number, input: { qu
 
   let searchFailed = false;
   let hasAnySuccess = false;
+
+  // ── Phase 0: Instant results from global database cache ──
+  if (source === "all" && process.env.NODE_ENV !== "test") {
+    addLog(`[Global Base] Checking local database for existing channels matching: [${subQueries.join(", ")}]...`);
+    const initialCached = searchCachedChannels(query, 50);
+    if (initialCached.length > 0) {
+      addLog(`[Global Base] Found ${initialCached.length} matching channels already in database. Loading instantly...`);
+      const toSave = initialCached.map(c => ({
+        title: c.title,
+        description: c.description || "",
+        subscribers: c.subscribers || null,
+        detailUrl: c.detailUrl,
+        imageUrl: c.imageUrl || null,
+        source: c.source,
+        telegramUrl: c.telegramUrl || null,
+        username: c.username || null,
+        channelDescription: c.channelDescription || null,
+        stats: c.stats,
+        extractionStatus: c.extractionStatus || "success",
+        chatType: c.chatType || "unknown",
+        error: null
+      }));
+      saveResults(searchId, toSave);
+      hasAnySuccess = true;
+    }
+  }
 
   try {
     for (let qIdx = 0; qIdx < subQueries.length; qIdx++) {
@@ -1065,7 +1251,7 @@ export async function runSearchJob(userId: number, searchId: number, input: { qu
 
         let page = 1;
         let hasMore = true;
-        const maxPages = limitPages;
+        const maxPages = src === "lyzem" ? Math.min(limitPages, 5) : limitPages;
 
         // Check if EXTRA_CATALOGS
         if (EXTRA_CATALOGS.includes(src)) {
@@ -1090,11 +1276,18 @@ export async function runSearchJob(userId: number, searchId: number, input: { qu
 
               searchStats[src].pagesFetched++;
               searchStats[src].totalFound += result.results.length;
-              if (result.results.length > 0) {
-                saveResults(searchId, result.results);
-                searchStats[src].uniqueAdded += result.results.length;
-                addLog(`[Page] [Saved] ${result.results.length} channels from ${src} saved to database.`);
+
+              const { relevant, discardedCount } = filterAndRankByRelevance(result.results, q);
+              if (discardedCount > 0) {
+                addLog(`[Relevance Engine] [${src}] Filtered out ${discardedCount} non-relevant channels for "${q}".`);
+              }
+
+              if (relevant.length > 0) {
+                saveResults(searchId, relevant);
+                searchStats[src].uniqueAdded += relevant.length;
+                addLog(`[Page] [Saved] ${relevant.length} relevant channels from ${src} saved to database.`);
                 hasAnySuccess = true;
+                void enrichResultsBatch(userId, searchId, relevant.slice(0, 10));
               }
               hasMore = result.hasMore && result.results.length > 0;
               page++;
@@ -1128,10 +1321,14 @@ export async function runSearchJob(userId: number, searchId: number, input: { qu
             searchStats[src].pagesFetched = 1;
             const tgResults = await searchTelegram(q);
             searchStats[src].totalFound = tgResults.length;
-            if (tgResults.length > 0) {
-              saveResults(searchId, tgResults);
-              searchStats[src].uniqueAdded += tgResults.length;
-              addLog(`[Saved] ${tgResults.length} channels from Telegram saved to database.`);
+            const { relevant, discardedCount } = filterAndRankByRelevance(tgResults, q);
+            if (discardedCount > 0) {
+              addLog(`[Relevance Engine] [Telegram] Filtered out ${discardedCount} non-relevant channels for "${q}".`);
+            }
+            if (relevant.length > 0) {
+              saveResults(searchId, relevant);
+              searchStats[src].uniqueAdded += relevant.length;
+              addLog(`[Saved] ${relevant.length} channels from Telegram saved to database.`);
               hasAnySuccess = true;
             }
             searchStats[src]._completedQueries = searchStats[src]._completedQueries || [];
@@ -1361,11 +1558,18 @@ export async function runSearchJob(userId: number, searchId: number, input: { qu
                 }
 
                 if (pageAddedResults.length > 0) {
-                  saveResults(searchId, pageAddedResults);
-                  newResultsInBatchCount += pageAddedResults.length;
-                  searchStats[src].uniqueAdded += pageAddedResults.length;
-                  hasAnySuccess = true;
-                  addLog(`[Page] [Saved] ${pageAddedResults.length} channels saved from ${src}.`);
+                  const { relevant, discardedCount } = filterAndRankByRelevance(pageAddedResults, q);
+                  if (discardedCount > 0) {
+                    addLog(`[Relevance Engine] Filtered out ${discardedCount} non-relevant channels on ${src}.`);
+                  }
+                  if (relevant.length > 0) {
+                    saveResults(searchId, relevant);
+                    newResultsInBatchCount += relevant.length;
+                    searchStats[src].uniqueAdded += relevant.length;
+                    hasAnySuccess = true;
+                    addLog(`[Page] [Saved] ${relevant.length} highly relevant channels saved from ${src}.`);
+                    void enrichResultsBatch(userId, searchId, relevant.slice(0, 10));
+                  }
                 } else if (rawCardCount === 0) {
                   consecutiveEmptyPages++;
                   addLog(`[Page] [${p}] empty (${consecutiveEmptyPages} consecutive empty)`);
@@ -1381,7 +1585,8 @@ export async function runSearchJob(userId: number, searchId: number, input: { qu
                 touchSearch(searchId, Math.min(99, Math.round(((sIdx + p / Math.max(maxPages, 1)) / sources.length) * 100)), src, searchStats, logs);
               } catch (err: any) {
                 addLog(`[Error] ${src} (Page ${p}): ${err.message}`);
-                if (src === "waybien") {
+                if (src === "waybien" || src === "tgramsearch" || /UND_ERR_CONNECT_TIMEOUT|ECONNREFUSED|timeout|timed out|Failed to fetch/i.test(err.message)) {
+                  addLog(`[Offline] ${src} appears to be unreachable. Skipping remaining pages.`);
                   sourceUnavailable = true;
                   break;
                 }

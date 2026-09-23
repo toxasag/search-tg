@@ -16,6 +16,8 @@ export interface ScrapedChannel {
   error?: string;
   timestamp: string;
   similarChannels?: { title: string; detailUrl: string; subscribers: string | null }[];
+  isCached?: boolean;
+  relevanceScore?: number;
 }
 
 export interface SearchStats {
@@ -57,4 +59,4 @@ export interface ManagedUser {
 }
 
 export type ParseMode = "fast" | "ai";
-export type SearchSource = "all" | "tgsearch" | "tgramcat" | "tgramsearch" | "waybien" | "lyzem" | "tgcat" | "catalogTelegram" | "tglib" | "telegram";
+export type SearchSource = "all" | "import" | "tgsearch" | "tgramcat" | "tgramsearch" | "waybien" | "lyzem" | "tgcat" | "catalogTelegram" | "tglib" | "telegram";

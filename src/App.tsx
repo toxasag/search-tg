@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { 
   Search, Globe, Database, Cpu, Settings, Play, ArrowDownToLine, 
   RefreshCw, CheckCircle, XCircle, AlertCircle, Copy, Check, 
   ExternalLink, Trash2, ListFilter, HelpCircle, Info, ChevronRight,
-  Eye, FileSpreadsheet, FileJson, FileText, Layers, MessageSquare, Lock, Hash, Users, BookOpen, LogOut, ShieldCheck
+  Eye, FileSpreadsheet, FileJson, FileText, Layers, MessageSquare, Lock, Hash, Users, BookOpen, LogOut, ShieldCheck,
+  Loader2, Sparkles
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { CurrentUser, ScrapedChannel, SearchQueryHistory, ParseMode, SearchSource, SearchStats } from "./types";
@@ -13,6 +14,31 @@ import AuthScreen from "./components/AuthScreen";
 import OwnerPanel from "./components/OwnerPanel";
 import ChangePasswordPanel from "./components/ChangePasswordPanel";
 import SearchTips from "./components/SearchTips";
+
+function getCleanMonogram(title: string): string {
+  if (!title) return "TG";
+  const clean = title.replace(/^[«"'\s@#]+/, "").trim();
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length >= 2 && words[0] && words[1]) {
+    return (words[0][0] + words[1][0]).toUpperCase();
+  }
+  return clean.slice(0, 2).toUpperCase() || "TG";
+}
+
+function getAvatarBgColor(title: string): string {
+  const colors = [
+    "bg-gradient-to-br from-blue-600 to-indigo-700 text-white",
+    "bg-gradient-to-br from-emerald-600 to-teal-700 text-white",
+    "bg-gradient-to-br from-purple-600 to-violet-800 text-white",
+    "bg-gradient-to-br from-amber-600 to-orange-700 text-white",
+    "bg-gradient-to-br from-rose-600 to-pink-700 text-white",
+    "bg-gradient-to-br from-cyan-600 to-blue-700 text-white",
+  ];
+  let hash = 0;
+  for (let i = 0; i < (title || "").length; i++) hash = title.charCodeAt(i) + ((hash << 5) - hash);
+  const idx = Math.abs(hash) % colors.length;
+  return colors[idx];
+}
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
@@ -97,6 +123,11 @@ export default function App() {
     setChannels(data.results);
     setLogs(data.logs || []);
     setLastSearchStats(data.searchStats || null);
+    setSourceFilter("all");
+    setTextFilter("");
+    setStatusFilter("all");
+    setChatTypeFilter("all");
+    setCurrentPage(1);
   };
 
   useEffect(() => {
@@ -173,6 +204,8 @@ export default function App() {
     setIsLogsOpen(true);
     setLastSearchStats(null);
     setChannels([]);
+    setActiveSearchId(null);
+    setActiveSearchStatus(null);
     setLogs([`[${new Date().toISOString()}] Initiating search for "${query.trim()}" across ${source === "all" ? "all directories" : source}...`]);
 
     try {
@@ -255,15 +288,37 @@ export default function App() {
     }
   };
 
-  const enrichImported = async () => {
-    addLog("[Import] Запуск массового обогащения импортированных ссылок.");
+  const [importStatus, setImportStatus] = useState<{ running: boolean; searchId: number | null; total: number; processed: number; enriched: number; failed: number } | null>(null);
+
+  const pollImportStatus = useCallback(async () => {
     try {
-      const res = await fetch("/api/import/enrich", { method: "POST" });
+      const res = await fetch("/api/import/enrich/status");
+      if (res.ok) {
+        const data = await res.json();
+        setImportStatus(data);
+        if (data.running) {
+          if (activeSearchId) void loadSearch(activeSearchId);
+          setTimeout(pollImportStatus, 2500);
+        } else if (data.total > 0) {
+          if (activeSearchId) await loadSearch(activeSearchId);
+          await loadSearches();
+        }
+      }
+    } catch {}
+  }, [activeSearchId]);
+
+  const enrichImported = async () => {
+    addLog("[Import] Запуск массового фонового обогащения импортированных ссылок.");
+    try {
+      const res = await fetch("/api/import/enrich", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searchId: activeSearchId ? Number(activeSearchId) : undefined })
+      });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      await loadSearch(activeSearchId || "");
-      setImportSummary(`Обогащение: обработано ${data.total} · обновлено ${data.updated} · ошибок ${data.failed}`);
-      addLog(`[Import] Обогащение: обновлено ${data.updated}, ошибок ${data.failed}.`);
+      setImportStatus(data);
+      pollImportStatus();
+      addLog(`[Import] Фоновое обогащение запущено. Ожидайте прогресса.`);
     } catch (error: any) { addLog(`[Import] Ошибка обогащения: ${error.message}`); }
   };
 
@@ -700,16 +755,51 @@ export default function App() {
                     <div className="relative">
                       <input 
                         type="text" 
-                        placeholder="e.g. freelance, crypto..." 
+                        placeholder="Например: бизнес тайланд, ремонт пхукет, крипта дубай..." 
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            if (!isSearching && query.trim()) {
+                              void handleSearch();
+                            }
+                          }
+                        }}
                         className="w-full bg-[#0A0B0E] border border-slate-700 rounded p-2.5 pl-9 text-xs text-slate-300 focus:outline-none focus:border-blue-500 font-medium transition-all"
                       />
                       <Search className="absolute left-3 top-3 text-slate-500 w-3.5 h-3.5" />
                     </div>
+
+                    {/* Quick suggestion chips */}
+                    <div className="mt-2 flex flex-wrap items-center gap-1">
+                      <span className="text-[10px] text-slate-500 mr-0.5">Примеры:</span>
+                      {[
+                        "бизнес тайланд, бизнес пхукет",
+                        "крипта дубай чат",
+                        "недвижимость бали",
+                        "it вакансии удаленка"
+                      ].map((sample) => (
+                        <button
+                          key={sample}
+                          type="button"
+                          onClick={() => setQuery(sample)}
+                          className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800/80 hover:bg-blue-600/20 text-slate-400 hover:text-blue-300 border border-slate-700/60 hover:border-blue-500/40 transition-colors"
+                        >
+                          {sample}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Helpful tips and multi-query info */}
                     <div className="mt-2.5 flex items-center justify-between">
-                      <span className="text-[10px] font-mono text-slate-500 leading-none">Multi-query (разделяйте через запятую)</span>
+                      <span className="text-[10px] font-mono text-slate-500 leading-none">Разделяйте запросы через запятую</span>
                       <SearchTips onSelectQuery={(template) => setQuery(template)} />
+                    </div>
+
+                    <div className="mt-2 p-2 rounded bg-blue-500/10 border border-blue-500/20 text-[11px] text-slate-300 leading-snug">
+                      <span className="text-amber-400 font-semibold mr-1">💡 Подсказка:</span>
+                      Указывайте конкретное гео или тему (напр. <i>бизнес тайланд</i>). Сервис сохраняет всё в базу и отсекает нерелевантный спам.
                     </div>
                   </div>
 
@@ -827,18 +917,58 @@ export default function App() {
                     if(!r.ok){ addLog(`[Import] ${d.error}`); setImportSummary(`Ошибка: ${d.error}`); return; }
                     setImportProgress(80);
                     el.value="";
-                    if (d.id) { await loadSearch(d.id); await loadSearches(); }
+                    if (d.id) {
+                      await loadSearch(d.id);
+                      await loadSearches();
+                      pollImportStatus();
+                    }
                     setImportProgress(100);
-                    const summary=`Получено: ${d.inputCount} · Уникальных: ${d.uniqueCount} · Дубликатов в файле: ${d.duplicateCount} · Уже в базе: ${d.alreadyStored || 0} · Новых: ${d.added || 0} · Preview: ${d.enriched}`;
+                    const summary = `Получено: ${d.inputCount} · Уникальных: ${d.uniqueCount} · Дубликатов: ${d.duplicateCount} · Из базы: ${d.alreadyStored || 0} · Новых: ${d.added || 0}`;
                     setImportSummary(summary);
-                    addLog(`[Import] ${summary}`);
-                  } catch (error:any) {
+                    addLog(`[Import] ${summary}. Фоновое обогащение запущено.`);
+                  } catch (error: any) {
                     setImportSummary(`Ошибка импорта: ${error.message}`);
                   } finally { setIsImporting(false); }
                 }} disabled={isImporting} className="mt-2 w-full bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white text-xs py-2 rounded">{isImporting ? `Загрузка ${importProgress}%...` : "Загрузить в базу"}</button>
                 {isImporting && <div className="mt-2 h-1.5 rounded bg-slate-800 overflow-hidden"><div className="h-full bg-blue-500 transition-all" style={{width:`${importProgress}%`}} /></div>}
                 {importSummary && <p className="mt-2 text-xs text-blue-300 break-words">{importSummary}</p>}
-                <button onClick={enrichImported} className="mt-2 w-full border border-slate-700 hover:border-blue-500 text-slate-300 text-xs py-2 rounded">Проверить тип, описание и аватар импортированных</button>
+                
+                <button 
+                  onClick={enrichImported} 
+                  disabled={Boolean(importStatus?.running)} 
+                  className="mt-2 w-full border border-slate-700 hover:border-blue-500 disabled:opacity-50 text-slate-300 text-xs py-2 rounded flex items-center justify-center gap-1.5 transition-colors"
+                >
+                  {importStatus?.running ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+                      <span>Идет обогащение списка...</span>
+                    </>
+                  ) : (
+                    "Проверить тип, описание и аватар импортированных"
+                  )}
+                </button>
+
+                {importStatus?.running && (
+                  <div className="mt-3 p-2.5 rounded bg-blue-950/60 border border-blue-500/30 text-xs text-blue-200 space-y-1.5">
+                    <div className="flex items-center justify-between font-mono text-[11px]">
+                      <span className="flex items-center gap-1.5 text-blue-300">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+                        Фоновая проверка
+                      </span>
+                      <span>{importStatus.processed} / {importStatus.total} ({importStatus.total ? Math.round((importStatus.processed / importStatus.total) * 100) : 0}%)</span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                      <div 
+                        className="h-full bg-blue-500 transition-all duration-300"
+                        style={{ width: `${importStatus.total ? (importStatus.processed / importStatus.total) * 100 : 0}%` }}
+                      />
+                    </div>
+                    <div className="flex justify-between text-[10px] text-slate-400">
+                      <span>Обогащено: {importStatus.enriched}</span>
+                      <span>Ошибок: {importStatus.failed}</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Niche Search History (Styled to look like the Target JSON Schema box) */}
@@ -1080,7 +1210,7 @@ export default function App() {
                   <div className="relative flex-1">
                     <input 
                       type="text" 
-                      placeholder="Filter results by keyword or description..."
+                      placeholder="Быстрый фильтр по таблице ниже (по названию или описанию)..."
                       value={textFilter}
                       onChange={(e) => setTextFilter(e.target.value)}
                       className="w-full bg-[#0A0B0E] pl-9 pr-3 py-1.5 text-xs rounded border border-slate-700 text-slate-300 focus:outline-none focus:border-blue-500 font-medium font-mono"
@@ -1091,7 +1221,7 @@ export default function App() {
                   <div className="flex flex-wrap gap-2 items-center">
                     {/* Source Filters */}
                     <div className="flex bg-[#0A0B0E] border border-slate-800 p-0.5 rounded text-[10px] font-mono">
-                      {(["all", "tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem", "tgcat", "catalogTelegram", "tglib", "telegram"] as const).map((sf) => (
+                      {(["all", "import", "tgsearch", "tgramcat", "tgramsearch", "waybien", "lyzem", "tgcat", "catalogTelegram", "tglib", "telegram"] as const).map((sf) => (
                         <button
                           key={sf}
                           onClick={() => setSourceFilter(sf)}
@@ -1161,10 +1291,28 @@ export default function App() {
                       {filteredChannels.length === 0 ? (
                         <tr>
                           <td colSpan={5} className="py-12 text-center text-slate-500 italic">
-                            {channels.length === 0 
-                              ? "No channels scraped yet. Submit a query to load directory list." 
-                              : "No channels match the filter query."
-                            }
+                            <div className="space-y-3 flex flex-col items-center justify-center">
+                              <span>
+                                {channels.length === 0 
+                                  ? "No channels scraped yet. Submit a query to load directory list." 
+                                  : `В текущей выборке ничего не найдено по фильтру "${textFilter}".`
+                                }
+                              </span>
+                              {channels.length > 0 && textFilter.trim() && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setQuery(textFilter.trim());
+                                    setTextFilter("");
+                                    void handleSearch();
+                                  }}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 transition-colors cursor-pointer not-italic font-sans"
+                                >
+                                  <Search className="w-3.5 h-3.5" />
+                                  <span>Запустить глубокий поиск по всем каталогам: "{textFilter.trim()}"</span>
+                                </button>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       ) : (
@@ -1179,21 +1327,30 @@ export default function App() {
                                     src={channel.imageUrl} 
                                     alt={channel.title}
                                     referrerPolicy="no-referrer"
-                                    className="w-8 h-8 rounded bg-slate-900 object-cover flex-shrink-0 border border-slate-800"
+                                    className="w-8 h-8 rounded-lg bg-slate-900 object-cover flex-shrink-0 border border-slate-700/60 shadow-sm"
                                     onError={(e) => {
-                                      (e.target as HTMLImageElement).src = `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(channel.title)}`;
+                                      (e.target as HTMLElement).style.display = "none";
+                                      const fallback = (e.target as HTMLElement).nextElementSibling;
+                                      if (fallback) (fallback as HTMLElement).classList.remove("hidden");
                                     }}
                                   />
-                                ) : (
-                                  <div className="w-8 h-8 rounded bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 font-bold text-xs flex-shrink-0 uppercase font-mono">
-                                    {channel.title.substring(0, 2)}
-                                  </div>
-                                )}
+                                ) : null}
+                                <div 
+                                  className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs flex-shrink-0 uppercase font-mono shadow-sm border border-white/10 ${getAvatarBgColor(channel.title)} ${channel.imageUrl ? "hidden" : "flex"}`}
+                                >
+                                  {getCleanMonogram(channel.title)}
+                                </div>
                                 <div className="space-y-0.5">
                                   <div className="font-semibold text-white group-hover:text-blue-400 transition-colors flex items-center gap-1.5 flex-wrap">
                                     <span>{channel.title}</span>
                                     {channel.username && (
                                       <span className="font-mono text-[10px] text-blue-400">@{channel.username}</span>
+                                    )}
+                                    {/* Global DB badge */}
+                                    {(channel.isCached || (channel.source && channel.source.startsWith("cached"))) && (
+                                      <span className="text-[8px] font-mono px-1.5 py-0.5 rounded leading-none font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/25">
+                                        💾 Из базы
+                                      </span>
                                     )}
                                     {/* Chat Type Badge */}
                                     <span className={`text-[8px] font-mono px-1.5 py-0.5 rounded leading-none uppercase font-bold tracking-wider ${

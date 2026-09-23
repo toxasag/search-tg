@@ -102,3 +102,41 @@ test("TXT normalizes protocols, deduplicates usernames and preserves invite case
   assert.equal(text, "https://t.me/phuket_test\n");
   assert.match(buildTxt([row], true), /Название: Phuket/);
 });
+
+test("import list preserves all links without dropping them via relevance filter", async () => {
+  let cookie = "";
+  await createSession({ cookie(name: string, value: string) { cookie = `${name}=${value}`; } } as any, { id: 1, email: "owner@test.local", role: "owner", mustChangePassword: false });
+  const http = app.listen(0, "127.0.0.1");
+  await new Promise<void>(resolve => http.once("listening", resolve));
+  const base = `http://127.0.0.1:${(http.address() as any).port}`;
+
+  try {
+    const rawLinks = `
+      https://t.me/channel_one
+      https://t.me/channel_two
+      https://t.me/channel_three
+    `;
+    const res = await nativeFetch(base + "/api/import", {
+      method: "POST",
+      headers: { cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ links: rawLinks })
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json() as any;
+    assert.equal(data.inputCount, 3);
+    assert.equal(data.uniqueCount, 3);
+    assert.equal(data.added, 3);
+    assert.ok(data.id, "Search ID must be returned");
+
+    // Fetch saved search
+    const searchRes = await nativeFetch(base + `/api/searches/${data.id}`, { headers: { cookie } });
+    assert.equal(searchRes.status, 200);
+    const searchData = await searchRes.json() as any;
+    assert.equal(searchData.results.length, 3, "All 3 imported channels must be present in search results");
+    assert.ok(searchData.results.some((r: any) => r.telegramUrl === "https://t.me/channel_one"));
+    assert.ok(searchData.results.some((r: any) => r.telegramUrl === "https://t.me/channel_two"));
+    assert.ok(searchData.results.some((r: any) => r.telegramUrl === "https://t.me/channel_three"));
+  } finally {
+    await new Promise<void>(resolve => http.close(() => resolve()));
+  }
+});

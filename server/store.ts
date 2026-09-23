@@ -1,5 +1,6 @@
 import { db, getCachedChannel, putCachedChannel } from "./db.js";
 import { normalizeTelegramLink } from "../src/telegram-links.js";
+import { calculateRelevance, tokenize } from "./relevance.js";
 
 export interface StoredChannelInput {
   title: string;
@@ -86,16 +87,8 @@ export function getSearchStatus(userId: number, searchId: number) {
   };
 }
 
-export function searchCachedChannels(query: string, limit = 100) {
-  const trimmed = query.trim();
-  if (!trimmed) return [];
-  const normalized = `%${trimmed.toLowerCase()}%`;
-  const rows = db.prepare(`
-    SELECT * FROM channels
-    WHERE LOWER(title) LIKE ? OR LOWER(description) LIKE ? OR LOWER(username) LIKE ? OR LOWER(telegram_url) LIKE ?
-    ORDER BY updated_at DESC LIMIT ?
-  `).all(normalized, normalized, normalized, normalized, limit) as any[];
-  return rows.map((row) => ({
+function mapCachedRow(row: any) {
+  return {
     id: `cached:${row.dedup_key}`,
     title: row.title,
     description: row.description,
@@ -113,7 +106,65 @@ export function searchCachedChannels(query: string, limit = 100) {
     timestamp: row.updated_at,
     similarChannels: parseJson(row.similar_channels),
     isCached: true,
-  }));
+  };
+}
+
+export function searchCachedChannels(query: string, limit = 100) {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    const rows = db.prepare(`SELECT * FROM channels ORDER BY updated_at DESC LIMIT ?`).all(limit) as any[];
+    return rows.map(mapCachedRow);
+  }
+
+  // Tokenize query words (longer than 2 characters)
+  const tokens = tokenize(trimmed).filter(t => t.length > 2);
+  let candidates: any[] = [];
+
+  if (tokens.length > 0) {
+    const conditions = tokens.map(() => `(LOWER(title) LIKE ? OR LOWER(description) LIKE ? OR LOWER(username) LIKE ?)`).join(" OR ");
+    const params: string[] = [];
+    for (const t of tokens) {
+      const p = `%${t.toLowerCase()}%`;
+      params.push(p, p, p);
+    }
+    candidates = db.prepare(`
+      SELECT * FROM channels
+      WHERE ${conditions}
+      LIMIT 1000
+    `).all(...params) as any[];
+  } else {
+    const normalized = `%${trimmed.toLowerCase()}%`;
+    candidates = db.prepare(`
+      SELECT * FROM channels
+      WHERE LOWER(title) LIKE ? OR LOWER(description) LIKE ? OR LOWER(username) LIKE ?
+      LIMIT 500
+    `).all(normalized, normalized, normalized) as any[];
+  }
+
+  // Deduplicate candidates by dedup_key
+  const seen = new Set<string>();
+  const uniqueCandidates = candidates.filter(r => {
+    if (seen.has(r.dedup_key)) return false;
+    seen.add(r.dedup_key);
+    return true;
+  });
+
+  // Score candidates with relevance engine
+  const scored = uniqueCandidates.map(row => {
+    const mapped = mapCachedRow(row);
+    const rel = calculateRelevance(mapped, trimmed);
+    return {
+      ...mapped,
+      relevanceScore: rel.score,
+      isRelevant: rel.isRelevant,
+      isCached: true,
+    };
+  }).filter(c => c.isRelevant);
+
+  // Sort descending by relevance score, then by updated_at
+  scored.sort((a, b) => b.relevanceScore - a.relevanceScore);
+
+  return scored.slice(0, limit);
 }
 
 export function claimSearch(searchId: number) {
@@ -161,6 +212,10 @@ export function saveResults(searchId: number, items: StoredChannelInput[]) {
       similar_channels = COALESCE(excluded.similar_channels, search_results.similar_channels),
       updated_at = CURRENT_TIMESTAMP
   `);
+  const searchRow = db.prepare("SELECT query, source FROM searches WHERE id = ?").get(searchId) as { query?: string; source?: string } | undefined;
+  const isImport = searchRow?.source === "import";
+  const searchQuery = !isImport ? searchRow?.query : undefined;
+
   db.transaction((records: StoredChannelInput[]) => {
     for (const rawItem of records) {
       const key = resultKey(rawItem);
@@ -178,6 +233,16 @@ export function saveResults(searchId: number, items: StoredChannelInput[]) {
         extractionStatus: cached.extractionStatus === "success" ? "success" : rawItem.extractionStatus,
         chatType: cached.chatType !== "unknown" ? cached.chatType : rawItem.chatType,
       } : rawItem;
+
+      // If the channel was previously enriched or cached and its true content is not relevant to the query, skip it.
+      // Never filter imported channels by search query relevance!
+      if (searchQuery && rawItem.source !== "import" && !isImport) {
+        const rel = calculateRelevance(item, searchQuery);
+        if (!rel.isRelevant) {
+          continue;
+        }
+      }
+
       putCachedChannel(key, item);
       upsert.run({
         searchId,
@@ -277,6 +342,9 @@ export function updateResult(userId: number, resultId: number, patch: Partial<St
     merged.similarChannels ? JSON.stringify(merged.similarChannels) : null,
     resultId,
   );
+  // Guarantee synchronization with global channels cache
+  const key = resultKey(merged as any);
+  putCachedChannel(key, merged);
   return getResult(userId, resultId);
 }
 
